@@ -20,11 +20,13 @@
 //|    1. A liquidity level (PDH/PDL, PWH/PWL,                        |
 //|       EQH/EQL) is crossed for the first time this period -> the   |
 //|       sweep arms (state 1 = bearish setup, state 2 = bullish).    |
-//|    2. The CE (structure) reference seeds at the TRUE wick extreme |
-//|       (min low / max high, no candle-colour restriction) within   |
-//|       CeScanBars M1 candles, then ratchets with structure: it     |
-//|       tracks the last CONFIRMED higher low (bearish setup) or     |
-//|       lower high (bullish), so it keeps pace with the move.       |
+//|    2. The CE (cambio estructural) is the swing that STARTED the  |
+//|       final leg into the liquidity: the low the last push up      |
+//|       began from (short) / the high the last push down began from |
+//|       (long). A pullback counts as a leg start only if it is at   |
+//|       least CeLegPct % of the leg that followed AND CeMinAtr x    |
+//|       ATR14. It moves only when price prints a new extreme whose  |
+//|       own starting swing is more recent (see CeRef).              |
 //|    3. Price closing back through the CE level confirms the break |
 //|       -> a PENDING entry (state 3/4): SL/TP are already frozen to |
 //|       the reaction's real wick extreme, and the order fires the   |
@@ -73,8 +75,9 @@ input int    EqlLookbackPivots = 5;
 input ENUM_TIMEFRAMES EqlRefTF = PERIOD_M15;
 
 input group "=== Structure (CE) ==="
-input int    CeScanBars    = 30;   // how far back to scan for the true wick extreme (SEED only)
-input int    CePivLen      = 3;    // bars each side confirming a CE structure swing
+input double CeLegPct      = 25.0; // CE: min pullback, % of the final leg that followed it
+input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
+input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
 
 input group "=== Risk Management ==="
@@ -114,7 +117,9 @@ bool     cycSessAsia = false, cycSessLondon = false, cycSessNy = false;
 
 double   sweepHi = 0, sweepLo = 0;           // wick extreme since the sweep (stop anchor)
 double   mssRefBear = 0, mssRefBull = 0;     // the CE level itself
-datetime mssRefBarTime = 0;                  // which M1 bar the CE level currently sits on (informational)
+datetime mssRefBarTime = 0;                  // which M1 bar the CE level currently sits on
+double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from
+double   atrM1 = 0; int atrCount = 0; double trSum = 0;  // Wilder ATR(14) on M1
 double   activeSweepPx = 0;
 
 int      attempt = 1;
@@ -276,67 +281,43 @@ void UpdateEqlOnNewRefBar()
   }
 
 //======================================================================
-// CE REFERENCE — true wick extreme within CeScanBars, no colour filter.
-// Mirrors the final, validated Pine fix exactly.
+// CE REFERENCE — mirrors Pine's f_ce_ref exactly.
 //======================================================================
+// Walking back from the extreme (shift eShift; 1 = the bar being processed),
+// the running low (short setup) / high (long setup) is the candidate; it
+// becomes the CE as soon as an older candle stands far enough beyond it:
+//   pullback >= max(CeLegPct % of the leg that followed, CeMinAtr x ATR14).
+// Returns 1 = found, 0 = no pullback qualified (level = deepest point of the
+// window), -1 = no data.
+int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
+  {
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int got = CopyRates(_Symbol, PERIOD_M1, 0, eShift + CeScanBars + 1, r);
+   if(got <= eShift + 2) return -1;
+   double ext = isBear ? r[eShift].high : r[eShift].low;
+   double m   = isBear ? r[eShift].low  : r[eShift].high;
+   datetime mt = r[eShift].time;
+   int found = 0;
+   for(int i = eShift + 1; i < got; i++)
+     {
+      double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
+      double cm  = isBear ? r[i].high - m : m - r[i].low;
+      if(cm > 0 && cm >= thr) { found = 1; break; }
+      if(isBear ? r[i].low < m : r[i].high > m) { m = isBear ? r[i].low : r[i].high; mt = r[i].time; }
+     }
+   level = m; lvlTime = mt;
+   return found;
+  }
 
-// lim caps how many M1 candles back to scan. This is the SEED ONLY: a
-// one-time backward lookup at the sweep bar for the pre-sweep origin candle.
-//
-// It used to drive relocation too, bounded at the sweep bar - which made the
-// relocation "the lowest low since the sweep". In a rally that value IS the
-// sweep candle's own low, permanently, so the CE could never move up however
-// far price ran above it. Relocation is now structural instead: see
-// CePivotLow/CePivotHigh below. Mirrors the Pine port's identical fix.
-double OriginLow(int lim)
+// Wilder ATR(14) of M1, updated once per processed bar (Pine ta.atr).
+void UpdateAtr(const M1Bar &bar)
   {
-   double res = -1;
-   for(int i=1;i<=lim;i++)
-     {
-      M1Bar b; if(!GetM1(i, b)) break;
-      if(res < 0 || b.l < res) res = b.l;
-     }
-   return res;
-  }
-double OriginHigh(int lim)
-  {
-   double res = -1;
-   for(int i=1;i<=lim;i++)
-     {
-      M1Bar b; if(!GetM1(i, b)) break;
-      if(res < 0 || b.h > res) res = b.h;
-     }
-   return res;
-  }
-// STRUCTURE for the CE ratchet: the last CONFIRMED M1 swing low / high.
-// The candidate sits CePivLen closed bars back, so CePivLen bars have closed
-// on each side of it by the time it confirms. Shift 0 (the still-forming
-// bar) is never read.
-bool CePivotLow(double &val, datetime &t)
-  {
-   int c = CePivLen + 1;
-   M1Bar cand; if(!GetM1(c, cand)) return false;
-   for(int i=1;i<=CePivLen;i++)
-     {
-      M1Bar l, r;
-      if(!GetM1(c+i, l) || !GetM1(c-i, r)) return false;
-      if(l.l <= cand.l || r.l <= cand.l) return false;
-     }
-   val = cand.l; t = cand.t;
-   return true;
-  }
-bool CePivotHigh(double &val, datetime &t)
-  {
-   int c = CePivLen + 1;
-   M1Bar cand; if(!GetM1(c, cand)) return false;
-   for(int i=1;i<=CePivLen;i++)
-     {
-      M1Bar l, r;
-      if(!GetM1(c+i, l) || !GetM1(c-i, r)) return false;
-      if(l.h >= cand.h || r.h >= cand.h) return false;
-     }
-   val = cand.h; t = cand.t;
-   return true;
+   double tr = bar.h - bar.l;
+   M1Bar p;
+   if(GetM1(2, p)) tr = MathMax(tr, MathMax(MathAbs(bar.h - p.c), MathAbs(bar.l - p.c)));
+   if(atrCount < 14) { trSum += tr; atrCount++; atrM1 = trSum / atrCount; }
+   else atrM1 = (atrM1 * 13.0 + tr) / 14.0;
   }
 
 //======================================================================
@@ -430,6 +411,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
    // --- daily/session trade counters ---
    int today = DayOf(bar.t);
    if(today != lastDay) { lastDay = today; tradesToday = 0; }
+   UpdateAtr(bar);
 
    bool inLondonNow = InLondon(bar.t);
    bool inNyNow     = InNy(bar.t);
@@ -465,9 +447,10 @@ void ProcessNewM1Bar(const M1Bar &bar)
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
          sweepHi = bar.h;
-         double org = OriginLow(CeScanBars);
-         mssRefBear = (org > 0) ? org : bar.l;
-         mssRefBarTime = bar.t;
+         ceExtHi = bar.h;
+         double lv = 0; datetime lt = bar.t;
+         mssRefBear = (CeRef(true, 1, lv, lt) >= 0) ? lv : bar.l;
+         mssRefBarTime = lt;
          activeSweepPx = lvl;
         }
       else if(AnyLowSweep(bar, lvl))
@@ -476,9 +459,10 @@ void ProcessNewM1Bar(const M1Bar &bar)
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
          sweepLo = bar.l;
-         double org = OriginHigh(CeScanBars);
-         mssRefBull = (org > 0) ? org : bar.h;
-         mssRefBarTime = bar.t;
+         ceExtLo = bar.l;
+         double lv = 0; datetime lt = bar.t;
+         mssRefBull = (CeRef(false, 1, lv, lt) >= 0) ? lv : bar.h;
+         mssRefBarTime = lt;
          activeSweepPx = lvl;
         }
      }
@@ -503,25 +487,37 @@ void ProcessNewM1Bar(const M1Bar &bar)
 
    // --- CE relocation while waiting (states 1/2) ---
    bool bearMss = false, bullMss = false;
+   // Break first, against the CE formed by the previous bars (a close, not
+   // a wick); only if there is no break does this bar extend the move. The
+   // CE moves only on a NEW extreme, and only to a MORE RECENT qualifying
+   // leg start - same rule as Pine.
    if(state == 1)
      {
-      if(bar.h > sweepHi) sweepHi = bar.h;
-      // Walk the CE UP to each newly confirmed higher low of this cycle:
-      // confirmed swing, belongs to this cycle, strictly higher, still below
-      // price. Monotone - a lower low is the setup failing, not structure.
-      double pvLo; datetime ptLo;
-      if(CePivotLow(pvLo, ptLo) && ptLo >= sweepBarTime && pvLo > mssRefBear && pvLo < bar.c)
-        { mssRefBear = pvLo; mssRefBarTime = ptLo; }
       if(bar.t > sweepBarTime && bar.c < mssRefBear) bearMss = true;
+      if(!bearMss)
+        {
+         if(bar.h > sweepHi) sweepHi = bar.h;
+         if(bar.h > ceExtHi)
+           {
+            ceExtHi = bar.h;
+            double lv = 0; datetime lt = 0;
+            if(CeRef(true, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBear = lv; mssRefBarTime = lt; }
+           }
+        }
      }
    else if(state == 2)
      {
-      if(bar.l < sweepLo) sweepLo = bar.l;
-      // Mirror: walk the CE DOWN to each newly confirmed lower high.
-      double pvHi; datetime ptHi;
-      if(CePivotHigh(pvHi, ptHi) && ptHi >= sweepBarTime && pvHi < mssRefBull && pvHi > bar.c)
-        { mssRefBull = pvHi; mssRefBarTime = ptHi; }
       if(bar.t > sweepBarTime && bar.c > mssRefBull) bullMss = true;
+      if(!bullMss)
+        {
+         if(bar.l < sweepLo) sweepLo = bar.l;
+         if(bar.l < ceExtLo)
+           {
+            ceExtLo = bar.l;
+            double lv = 0; datetime lt = 0;
+            if(CeRef(false, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBull = lv; mssRefBarTime = lt; }
+           }
+        }
      }
 
    if(bearMss) { state = 3; mssBarTime = bar.t; }

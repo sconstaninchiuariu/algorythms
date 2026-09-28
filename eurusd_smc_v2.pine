@@ -1,6 +1,6 @@
 // This Pine Script(tm) code is subject to the terms of the Mozilla Public License 2.0
 // Liquidity Algo — POI liquidated > structure break (CE) > entry
-// HTF Bias: Monthly/Weekly/Daily/4H/1H FVG | POIs: PDH/PDL, PWH/PWL, Asia, EQH/EQL
+// POIs: 1H/4H/D/W/MN imbalances (FVG), PDH/PDL, PWH/PWL, EQH/EQL | CE = close beyond the swing that started the final leg
 // Kill Zones: Asia 00:00-08:00 | London 09:00-11:00 | NY 14:00-16:30 (UTC+2)
 // Risk: Tiered non-compounded 1.00%-1.55% (+0.11/attempt) | SL=reaction extreme | TP=SLxRR
 // Execution: 1-minute chart only, London/NY sessions, max 2 trades per session
@@ -86,13 +86,16 @@ sess_box_max = input.int(3, "Max Boxes per Session (oldest dropped)", 2, 30, gro
 var string GLIQ = "Liquidity Levels (HTF POIs)"
 use_pdhl  = input.bool(true,    "PDH / PDL (Previous Day)",  group = GLIQ)
 use_pwhl  = input.bool(true,    "PWH / PWL (Previous Week)", group = GLIQ)
-sw_len    = input.int(10,       "Swing Lookback (MSS ref)",  2, 50, group = GLIQ)
+sw_len    = input.int(10,       "EQH/EQL Pivot Strength (ref-TF candles each side)",  2, 50, group = GLIQ)
 sweep_buf = input.float(0.0002, "Sweep Buffer", 0.00005, 0.001, 0.00001, group = GLIQ)
 
 var string GMSS = "MSS Settings"
 mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the sweep)", 5, 500, group = GMSS, tooltip = "How long the bot keeps hunting for the structure break after a zone is liquidated. Price often sweeps a level and then keeps running for another 50-80 bars before the actual reaction, so a short deadline kills the setup right before the trade it was waiting for. A cycle is also abandoned immediately if the session it armed in ends first (Asia/London/NY) — it never waits across a session boundary — so this deadline mainly matters for setups that time out within the same session.")
-ce_scan_bars = input.int(30,  "CE Reference Scan (candles back)", 3, 100, group = GMSS, tooltip = "Used ONLY to seed the CE the moment a zone is liquidated: the TRUE extreme (wick, not body/colour) reached within this many candles back — the actual lowest low / highest high of the reaction, not just \"the last candle of the opposite colour\", since the real extreme is sometimes made by a candle that closed the other way (e.g. a lower low made by a candle that still closed bullish). Once the cycle is running the CE no longer rescans this window; it follows structure (see CE Structure Confirmation below).")
-ce_piv_len   = input.int(3,   "CE Structure Confirmation (bars each side)", 1, 20, group = GMSS, tooltip = "After the seed, the CE tracks the last HIGHER LOW of the rally (bearish setup) or the last LOWER HIGH of the decline (bullish setup) — the standard CHoCH reference. A swing counts once it has this many candles on each side, so the level moves on real structure instead of on every candle. Lower = follows price faster with more noise; higher = fewer, cleaner relocations with more lag.")
+ce_leg_pct   = input.float(25.0, "CE: Min Pullback (% of final leg)", 5.0, 100.0, 5.0, group = GMSS, tooltip = "CE = the swing that STARTED the final leg into the liquidity (short: the low the last push up began from; long: the high the last push down began from). A pullback only counts as the start of a leg if it is at least this % of the leg that followed it, so small pauses inside one push are ignored.")
+ce_min_atr   = input.float(1.0,  "CE: Min Pullback (x ATR 14)", 0.0, 5.0, 0.1, group = GMSS, tooltip = "Absolute floor for the same pullback, in ATR(14) of the chart: stops 1-2 candle micro-dips from becoming the CE.")
+ce_scan_bars = input.int(60,     "CE: Lookback (candles)", 10, 300, group = GMSS, tooltip = "How far back from the extreme the start of the final leg is searched. If no qualifying pullback exists in this window (one straight impulse), the CE is the lowest low (short) / highest high (long) of the window.")
+ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every structure change (CE) the engine detects inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rule the entries use — to audit where the CE is placed.")
+ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
 var string GFVG = "FVG / Imbalance"
 use_fvg_entry = input.bool(false, "Wait for the imbalance retest (otherwise enter on the CE candle)", group = GFVG, tooltip = "OFF (default): liquidity is taken, the CE level is broken, and the order goes in on that very candle. ON: after the break the bot waits for price to come back and retest the imbalance the reaction left behind.")
@@ -159,7 +162,9 @@ vis_max_side = input.int(2, "Max Lines Above / Below Price", 1, 10, group = GVIS
 vis_dist_pct   = input.float(0.25, "Manual: Visibility Distance (% of price)", 0.05, 2.0, 0.01, group = GVIS,
      tooltip = "Used only in Manual mode: a zone shows only while price is within this % of price from it.")
 merge_tol   = input.float(0.0005, "Zone Merge Tolerance", 0.00010, 0.005, 0.00010, group = GVIS,
-     tooltip = "Zones within this price distance of each other collapse into one line, names joined with \"+\".")
+     tooltip = "Zones within this price distance of each other collapse into one line, names joined with \"·\".")
+lbl_off_bars = input.int(3, "Labels: candles right of the last candle", 0, 30, group = GVIS,
+     tooltip = "Labels of live lines sit this many candles to the right of the last candle, in the chart's right margin, instead of on top of price. Names are just the source: 1H / 4H / D / W / MN for imbalances, PDH / PDL / PWH / PWL / EQH / EQL for levels.")
 
 var string GALR = "Proximity Alerts"
 use_near_alert       = input.bool(true, "Alert when price nears a POI zone", group = GALR)
@@ -268,10 +273,13 @@ f_sess_key(int t) =>
         res := d * 10 + b
     res
 
-// Current session key: the live clock on the realtime bar, the end of the
-// last bar otherwise (the last bar's OPEN would differ between a 1m and a 4H
-// chart; its end doesn't).
-cur_sess_key = f_sess_key(barstate.isrealtime ? timenow : barstate.islast ? math.min(timenow, time_close) - 1 : time)
+// Current session key, from the real clock on the last bar: a level swept in
+// a session that has ENDED is gone, including over a weekend or with the
+// market closed (the old "end of the last bar" clock stayed inside Friday's
+// last session all weekend, so Friday's swept lines never expired). Realtime
+// bars cap it at the bar's own close so Bar Replay still follows the replayed
+// clock. History bars draw nothing, their value is irrelevant.
+cur_sess_key = f_sess_key(barstate.isrealtime ? math.min(timenow, time_close - 1) : barstate.islast ? timenow : time)
 
 // Aggregates chart bars into candles of the period p = time(tf). Returns the
 // just-completed candle (open time, high, low) and the new period's start
@@ -425,8 +433,9 @@ f_gap_cross(array<float> near_arr, array<float> far_arr, array<int> org_arr, arr
     int   xt   = na
     int   xo   = na
     int   n = array.size(near_arr)
-    if n > 0
-        outer_flags = f_recompute_outer(near_arr, far_arr, org_arr, is_supply, leg_ms)
+    // Native min/max first: on the vast majority of bars price is nowhere
+    // near any gap and the per-gap loop is skipped entirely.
+    if n > 0 and (is_supply ? high >= array.min(near_arr) : low <= array.max(near_arr))
         hits = array.new_int(0)
         tms  = array.new_int(0)
         for i = 0 to n - 1
@@ -438,6 +447,7 @@ f_gap_cross(array<float> near_arr, array<float> far_arr, array<int> org_arr, arr
                     array.push(tms, t_hit)
         nh = array.size(hits)
         if nh > 0
+            outer_flags = f_recompute_outer(near_arr, far_arr, org_arr, is_supply, leg_ms)
             for k = 0 to nh - 1
                 i = array.get(hits, k)
                 e = array.get(near_arr, i)
@@ -463,7 +473,7 @@ f_htf_gap_nearest(array<float> near_arr, array<float> far_arr, array<int> org_ar
     float best_far = na
     int   best_org = na
     int   n = array.size(near_arr)
-    if n > 0
+    if n > 0 and barstate.islast
         int best_i = 0
         for i = 0 to n - 1
             e = array.get(near_arr, i)
@@ -834,21 +844,6 @@ else if in_asia[1]
     asia_live_l := na
 
 // =============================================================
-// SWING HIGHS / LOWS
-// =============================================================
-
-raw_swh = ta.pivothigh(high, sw_len, sw_len)
-raw_swl = ta.pivotlow(low,  sw_len, sw_len)
-
-var float last_swh = na
-var float last_swl = na
-
-if not na(raw_swh)
-    last_swh := raw_swh
-if not na(raw_swl)
-    last_swl := raw_swl
-
-// =============================================================
 // EQUAL HIGHS / LOWS
 // =============================================================
 // Pivots for EQH/EQL come from the fixed eql_ref_tf candles (default 1H),
@@ -915,6 +910,10 @@ f_eqh_push(array<float> px_arr, array<int> bar_arr, array<int> cre_arr, float px
         array.push(px_arr, px)
         array.push(bar_arr, bar)
         array.push(cre_arr, cre)
+        if array.size(px_arr) > 100
+            array.shift(px_arr)
+            array.shift(bar_arr)
+            array.shift(cre_arr)
     array.size(px_arr)
 
 // One closed reference candle: extend the pivot buffer, confirm a pivot
@@ -965,7 +964,7 @@ f_eqh_cross(array<float> px_arr, array<int> bar_arr, array<int> cre_arr, bool is
     int   touched_bar = na
     int   touched_xt  = na
     n = array.size(px_arr)
-    if n > 0
+    if n > 0 and (is_high ? high >= array.min(px_arr) : low <= array.max(px_arr))
         for j = 0 to n - 1
             i = n - 1 - j
             e = array.get(px_arr, i)
@@ -987,7 +986,7 @@ f_eqh_nearest(array<float> px_arr, array<int> bar_arr) =>
     float best     = na
     int   best_bar = na
     n = array.size(px_arr)
-    if n > 0
+    if n > 0 and barstate.islast
         for i = 0 to n - 1
             e = array.get(px_arr, i)
             if na(best) or math.abs(close - e) < math.abs(close - best)
@@ -1017,142 +1016,59 @@ else if ae_done
 
 
 // =============================================================
-// STRUCTURE REFERENCE — seed for the break level
+// CE (CAMBIO ESTRUCTURAL) — the structure level an entry waits for
 // =============================================================
-// The break level itself is market structure: for a short setup the last
-// HIGHER LOW, for a long setup the last LOWER HIGH, and it only advances when
-// price prints a new structural extreme (a new higher high / lower low). That
-// tracking lives in the state machine below, where the running extreme is
-// already maintained.
+// Definition (ICT market structure shift / SMC change of character): once
+// liquidity is taken, the CE is the swing that STARTED the final leg into
+// that liquidity, and it is confirmed only by a candle CLOSING beyond it —
+// a wick through it is another liquidity grab, not a break.
+//   Short setup (highs taken): the low the last push up began from.
+//   Long setup  (lows taken):  the high the last push down began from.
 //
-// What is needed HERE is only the SEED — the level at the very bar the zone is
-// liquidated, before any pullback has had a chance to form. That is the ORIGIN
-// CANDLE: the last candle of the opposite colour before the impulse that ran
-// into the sweep. For a short setup, the LOW of the last bearish candle of the
-// rally. Taken from the user's working "Sweep + BOS" strategy (chochS/chochL).
+// "Started the final leg" is decided by depth, not by candle count. Walking
+// back from the extreme, the running low (short setup) is the candidate; it
+// becomes the CE as soon as an older candle stands far enough above it —
+// i.e. the counter-move that preceded it was a real pullback:
+//     pullback >= max(ce_leg_pct % of the leg that followed, ce_min_atr x ATR14)
+// The % term makes it scale-free (a pause inside one push is small relative
+// to the push, so it is skipped); the ATR term stops 1-2 candle micro-dips
+// from ever qualifying. Every earlier failure mode came from moving the level
+// on candle events instead of on this definition:
+//   - a pivot confirmed N bars later: late, missed the real swing;
+//   - the deepest wick of a fixed window: the bottom of the whole rally;
+//   - any post-sweep pivot (the old ratchet): a pullback AFTER the extreme,
+//     which is not the swing that created it — the CE sat on a minor
+//     internal high/low and fired early.
+atr_ce = ta.atr(14)
 
-// THE TRUE EXTREME — what the CE level actually is.
-//
-// Two things were tried and rejected before this:
-//   - a confirmed ta.pivothigh/pivotlow: correctly wick-based, but only
-//     confirms ce_piv bars AFTER it prints, so a reaction extreme that forms
-//     right before the breakout often hadn't confirmed in time and got
-//     missed entirely — the level stayed on an older, stale pivot.
-//   - "the last candle of the opposite colour" (an origin-candle scan by
-//     BODY): no confirmation lag, but wrong for a real, concrete case — a
-//     bearish candle followed by one that dips to an even LOWER low but
-//     still closes bullish. The body-colour restriction picks the first
-//     (bearish) candle and misses the true low the second one made.
-// The SEED level is simply the TRUE EXTREME (min low / max high, wick, no
-// colour restriction) within the scan window — no confirmation delay, and it
-// can never miss the real extreme regardless of which candle's body happens
-// to close which way. Each function returns the level AND the bar it was
-// found on in one pass (they used to be two functions running the identical
-// loop twice per call site).
-//
-// ROOT CAUSE #8 — a setup entered correctly at the reaction low the first
-// time it was watched, then later (same cycle, no code change) entered way
-// up near the top of the move instead. The scan window was always "the last
-// ce_scan_bars candles counted back from RIGHT NOW", with no relation to
-// when the sweep that started this cycle actually happened, so a later
-// relocation silently slid the window into unrelated price action near the
-// top of the move.
-//
-// ROOT CAUSE #9 (the fix that made both of the above moot) — capping that
-// same window at the sweep bar, which is what #8's fix did, turned the
-// relocation into "the lowest low since the sweep". In a rally that value
-// IS the sweep candle's own low, permanently: the CE could never move up,
-// no matter how far price ran above it. Reported as "price kept liquidating
-// higher and the CE zone never updated" — and it was not a tuning problem,
-// the scan was mathematically pinned to the bottom of the move.
-//
-// So the extreme scan is now the SEED ONLY — one backward look at the sweep
-// bar for the pre-sweep origin candle, which is exactly what it was always
-// right for. Everything after that is structural: see ce_piv_lo/ce_piv_hi
-// below and the ratchet in the state machine.
-f_origin_low(int lim) =>
-    float res   = na
-    int   res_i = na
-    for i = 1 to lim
-        if na(res) or low[i] < res
-            res   := low[i]
-            res_i := i
-    [res, na(res_i) ? na : bar_index - res_i]
-
-f_origin_high(int lim) =>
-    float res   = na
-    int   res_i = na
-    for i = 1 to lim
-        if na(res) or high[i] > res
-            res   := high[i]
-            res_i := i
-    [res, na(res_i) ? na : bar_index - res_i]
-
-// ROOT CAUSE — the seed above picks the single DEEPEST wick anywhere in the
-// scan window, not "the last confirmed higher low before the reaction",
-// which is what the ratchet further down actually walks forward from. Those
-// are two different definitions of "origin", and the mismatch is exactly
-// what put the CE at the bottom of an old rally instead of at the obvious
-// recent pullback low right before the reaction that got swept: the ratchet
-// can only adopt a pivot that confirms ON OR AFTER the arm bar (by design —
-// it must never reach back into stale pre-cycle history), so a real,
-// correct pivot that happens to sit just BEFORE the arm bar can never be
-// adopted there. The fix is a seed that uses the SAME definition the
-// ratchet uses — the nearest confirmed swing pivot behind the current bar —
-// so the two agree from the very first bar of the cycle, with the old
-// deepest-wick scan kept only as a fallback for a sharp move with no
-// confirmable pullback at all (so a cycle can never end up with no seed).
-f_seed_pivot_low(int lim) =>
+// [level, bar_index, found] of the swing that started the final leg into the
+// extreme printed e_off bars ago. short_side: the extreme is a HIGH (short
+// setup) and the CE is a low; otherwise the mirror. found = false means no
+// pullback qualified inside the lookback and the level is the window's
+// deepest point (one straight impulse) — usable as a starting CE, never as
+// a relocation.
+f_ce_ref(bool short_side, int e_off) =>
     float res     = na
     int   res_bar = na
-    // Guard, not just "the loop skips": Pine's `for a to b` auto-reverses
-    // (counts down) when a > b instead of doing nothing, so this must be
-    // checked explicitly rather than relied on to naturally no-op.
-    if lim >= 2 * ce_piv_len + 1
-        for i = ce_piv_len + 1 to lim - ce_piv_len
-            bool ok = true
-            for k = 1 to ce_piv_len
-                if low[i - k] <= low[i] or low[i + k] <= low[i]
-                    ok := false
-            if ok
-                res     := low[i]
-                res_bar := bar_index - i
+    bool  found   = false
+    lim = math.min(ce_scan_bars, 495 - e_off)
+    if e_off >= 0 and lim >= 2
+        float ext = short_side ? high[e_off] : low[e_off]
+        float m   = short_side ? low[e_off]  : high[e_off]
+        int   m_i = e_off
+        for i = e_off + 1 to e_off + lim
+            thr = math.max(math.abs(ext - m) * ce_leg_pct / 100.0, ce_min_atr * nz(atr_ce))
+            cm  = short_side ? high[i] - m : m - low[i]
+            if cm > 0 and cm >= thr
+                found := true
                 break
-    if na(res)
-        [res2, res2_bar] = f_origin_low(lim)
-        res     := res2
-        res_bar := res2_bar
-    [res, res_bar]
+            if short_side ? low[i] < m : high[i] > m
+                m   := short_side ? low[i] : high[i]
+                m_i := i
+        res     := m
+        res_bar := bar_index - m_i
+    [res, res_bar, found]
 
-f_seed_pivot_high(int lim) =>
-    float res     = na
-    int   res_bar = na
-    if lim >= 2 * ce_piv_len + 1
-        for i = ce_piv_len + 1 to lim - ce_piv_len
-            bool ok = true
-            for k = 1 to ce_piv_len
-                if high[i - k] >= high[i] or high[i + k] >= high[i]
-                    ok := false
-            if ok
-                res     := high[i]
-                res_bar := bar_index - i
-                break
-    if na(res)
-        [res2, res2_bar] = f_origin_high(lim)
-        res     := res2
-        res_bar := res2_bar
-    [res, res_bar]
-
-// STRUCTURE for the CE ratchet: the last CONFIRMED swing low / swing high.
-// A bearish CHoCH is price closing below the last HIGHER LOW of the uptrend,
-// so while a bearish cycle is live the reference walks UP from one confirmed
-// higher low to the next (and mirror-image for a bullish cycle). Confirmation
-// costs ce_piv_len bars of lag, which is what stops every single candle from
-// dragging the level around — the exact failure mode of every earlier
-// non-confirmed attempt.
-ce_piv_lo  = ta.pivotlow(low,   ce_piv_len, ce_piv_len)
-ce_piv_hi  = ta.pivothigh(high, ce_piv_len, ce_piv_len)
-ce_piv_bar = bar_index - ce_piv_len
 
 // =============================================================
 // TIERED RISK ENGINE
@@ -1290,13 +1206,24 @@ var bool  cyc_sess_asia = false
 var bool  cyc_sess_lon  = false
 var bool  cyc_sess_ny   = false
 
-// The running extreme of the reaction, wick included — the stop anchor, and
-// nothing else. The stop must sit beyond the real price reached, so this
-// tracks every new wick extreme unconditionally. It is deliberately NOT the
-// CE reference: the CE follows confirmed structure (ce_piv_lo/ce_piv_hi),
-// not the extreme of the move.
+// The running extreme of the reaction, wick included — the stop anchor. The
+// stop must sit beyond the real price reached, so this tracks every new wick
+// extreme unconditionally.
 var float sweep_hi     = na
 var float sweep_lo     = na
+// The extreme the CE is measured from (the leg it looks back along) and its
+// bar. Same as the sweep extreme during a normal cycle; after a failed
+// imbalance retest (use_fvg_entry) it restarts from the post-break extreme.
+var float ce_ext_hi     = na
+var int   ce_ext_hi_bar = na
+var float ce_ext_lo     = na
+var int   ce_ext_lo_bar = na
+// Extreme printed after the structure break, while waiting for the retest:
+// the new starting point if that retest fails and the cycle re-arms.
+var float post_hi       = na
+var int   post_hi_bar   = na
+var float post_lo       = na
+var int   post_lo_bar   = na
 var float mss_ref_bear = na
 var float mss_ref_bull = na
 // Bar the CE level actually printed on (the swing/origin candle), so the line
@@ -1468,13 +1395,13 @@ if (state == 0 and any_hs) or (state == 2 and hs_imb_gated)
     // bot waits for structure (equivalent to maxAfterSweepPDH in the working
     // PDH/PDL strategy).
     sweep_hi     := high
-    // Structure reference SEED = the ORIGIN CANDLE: the extreme of the rally
-    // that ran into the sweep. Price closing below it is the break. Falls
-    // back to this candle's own low only if none was found. From the next
-    // bar on, the ratchet takes over and walks this level up with structure.
-    [org_seed_b, org_seed_b_bar] = f_seed_pivot_low(ce_scan_bars)
-    mss_ref_bear := na(org_seed_b) ? low : org_seed_b
-    mss_ref_bar  := na(org_seed_b_bar) ? bar_index : org_seed_b_bar
+    // CE = the low the push that took the liquidity started from (f_ce_ref).
+    // Price CLOSING below it is the break.
+    ce_ext_hi     := high
+    ce_ext_hi_bar := bar_index
+    [ce_arm_b, ce_arm_b_bar, ce_arm_b_ok] = f_ce_ref(true, 0)
+    mss_ref_bear := na(ce_arm_b) ? low : ce_arm_b
+    mss_ref_bar  := na(ce_arm_b_bar) ? bar_index : ce_arm_b_bar
     state_bar    := bar_index
     cnt_sweep    += 1
     cyc_touched   := false
@@ -1512,10 +1439,12 @@ if (state == 0 and any_ls) or (state == 1 and ls_imb_gated)
     cyc_sess_lon  := in_london
     cyc_sess_ny   := in_ny
     sweep_lo     := low
-    // Mirror: the extreme of the decline that ran into the sweep.
-    [org_seed_u, org_seed_u_bar] = f_seed_pivot_high(ce_scan_bars)
-    mss_ref_bull := na(org_seed_u) ? high : org_seed_u
-    mss_ref_bar  := na(org_seed_u_bar) ? bar_index : org_seed_u_bar
+    // Mirror: the high the push down that took the liquidity started from.
+    ce_ext_lo     := low
+    ce_ext_lo_bar := bar_index
+    [ce_arm_u, ce_arm_u_bar, ce_arm_u_ok] = f_ce_ref(false, 0)
+    mss_ref_bull := na(ce_arm_u) ? high : ce_arm_u
+    mss_ref_bar  := na(ce_arm_u_bar) ? bar_index : ce_arm_u_bar
     state_bar    := bar_index
     cnt_sweep    += 1
     cyc_touched   := false
@@ -1576,53 +1505,29 @@ if sess_carried_over
 bear_mss = state == 1 and bar_index > sweep_bar and not na(mss_ref_bear) and close < mss_ref_bear
 bull_mss = state == 2 and bar_index > sweep_bar and not na(mss_ref_bull) and close > mss_ref_bull
 
-// ROOT CAUSE #6 — WHEN the break level is allowed to move. Five references
-// were tried before this one, all failing because they moved on candle-level
-// events instead of on market structure.
-//
-//   a) The extreme of the whole move since the sweep. Only breaks at the very
-//      END of the move — the LONG that fired at the top of the rally.
-//   b) The low of the candle that made each new high. The first pullback
-//      candle breaks it: breaks everywhere.
-//   c) A short swing pivot re-anchored freely, so the level jumped around.
-//   d) The origin candle recomputed on every "impulse" candle, where impulse
-//      meant nothing more than low < low[1] and close < close[1] — any
-//      ordinary bearish candle. A single red candle mid-rally moved the level.
-//   e) The running pullback extreme, re-anchored on every new structural
-//      extreme. Right after a liquidation price nearly always prints a few
-//      marginal new lows, and each one overwrote the correctly detected level
-//      with the previous candle's high, sitting right next to price. That is
-//      the level identified correctly at first and then walking away.
-//
-// The definition (standard SMC, and what the user described): a bullish CHoCH
-// is price closing above the last LOWER HIGH of a downtrend, a bearish CHoCH
-// is price closing below the last HIGHER LOW of an uptrend. The operative
-// refinement is that a new extreme only RELOCATES the level if it created a
-// new break point — a confirmed swing. Price grinding to marginal new
-// extremes inside one leg creates no swing and must leave the level alone.
-//
-// THE RATCHET (ROOT CAUSE #9). While a bearish cycle is live, the CE walks
-// UP to each newly confirmed HIGHER LOW and can never walk back down; the
-// bullish cycle mirrors it downward. Three conditions, all necessary:
-//
-//   1. the swing is CONFIRMED (ce_piv_len candles either side) — this is
-//      what keeps ordinary candles inside one leg from moving the level,
-//      the failure of every earlier unconfirmed attempt;
-//   2. it belongs to THIS cycle (printed at or after the sweep bar), so a
-//      stale pre-sweep swing can never be adopted;
-//   3. it is strictly HIGHER than the current reference (monotone) and still
-//      below price — a lower low is the setup failing, not new structure,
-//      and a level already above price would fire an instant fake break.
-//
-// Together these give exactly the textbook reference — "the last higher low
-// of the uptrend" — that keeps pace with a rally instead of staying pinned
-// to where the rally began.
+// WHEN THE CE MOVES. Only when price prints a NEW extreme of the move (a
+// higher high in a short setup, a lower low in a long one): that new push has
+// its own starting swing, recomputed with f_ce_ref from the new extreme. The
+// new level is adopted only if the pullback it found is MORE RECENT than the
+// current CE (the reference never jumps back in time to an older, deeper
+// swing) and it genuinely qualified (not the no-pullback fallback). So:
+//   - marginal new extremes inside one push find no new qualifying pullback
+//     and leave the CE where it is;
+//   - a real pullback followed by a new extreme moves the CE to the low
+//     (high) that new push started from — the textbook trailing CHoCH level;
+//   - a pullback AFTER the extreme that is not followed by a new extreme
+//     never moves the CE (it did not create any extreme; the old ratchet
+//     adopted exactly those and put the CE on minor internal swings).
 if state == 1 and not bear_mss
     if high > sweep_hi
         sweep_hi := high
-    if not na(ce_piv_lo) and ce_piv_bar >= sweep_bar and (na(mss_ref_bear) or ce_piv_lo > mss_ref_bear) and ce_piv_lo < close
-        mss_ref_bear := ce_piv_lo
-        mss_ref_bar  := ce_piv_bar
+    if high > ce_ext_hi
+        ce_ext_hi     := high
+        ce_ext_hi_bar := bar_index
+        [ce_mv_b, ce_mv_b_bar, ce_mv_b_ok] = f_ce_ref(true, 0)
+        if ce_mv_b_ok and (na(mss_ref_bar) or ce_mv_b_bar > mss_ref_bar)
+            mss_ref_bear := ce_mv_b
+            mss_ref_bar  := ce_mv_b_bar
     if not na(mss_ref_line)
         // x1 must move too — a relocation moves the CE to a DIFFERENT candle,
         // not just a different price, so the line's start needs to follow.
@@ -1635,9 +1540,13 @@ if state == 1 and not bear_mss
 if state == 2 and not bull_mss
     if low < sweep_lo
         sweep_lo := low
-    if not na(ce_piv_hi) and ce_piv_bar >= sweep_bar and (na(mss_ref_bull) or ce_piv_hi < mss_ref_bull) and ce_piv_hi > close
-        mss_ref_bull := ce_piv_hi
-        mss_ref_bar  := ce_piv_bar
+    if low < ce_ext_lo
+        ce_ext_lo     := low
+        ce_ext_lo_bar := bar_index
+        [ce_mv_u, ce_mv_u_bar, ce_mv_u_ok] = f_ce_ref(false, 0)
+        if ce_mv_u_ok and (na(mss_ref_bar) or ce_mv_u_bar > mss_ref_bar)
+            mss_ref_bull := ce_mv_u
+            mss_ref_bar  := ce_mv_u_bar
     if not na(mss_ref_line)
         line.set_x1(mss_ref_line, mss_ref_bar)
         line.set_y1(mss_ref_line, mss_ref_bull)
@@ -1658,6 +1567,8 @@ if bear_mss
     state        := 3
     state_bar    := bar_index
     cnt_mss      += 1
+    post_hi      := high
+    post_hi_bar  := bar_index
     if not na(mss_ref_line)
         line.set_x2(mss_ref_line, bar_index)
         line.set_extend(mss_ref_line, extend.none)
@@ -1669,6 +1580,8 @@ if bull_mss
     state        := 4
     state_bar    := bar_index
     cnt_mss      += 1
+    post_lo      := low
+    post_lo_bar  := bar_index
     if not na(mss_ref_line)
         line.set_x2(mss_ref_line, bar_index)
         line.set_extend(mss_ref_line, extend.none)
@@ -1717,6 +1630,12 @@ if bull_mss
 // take the trade. Re-arming keeps it hunting until either a valid entry
 // appears or the whole cycle times out mss_max_bars after the sweep.
 rearm_ok = (bar_index - sweep_bar) <= mss_max_bars
+if state == 3 and bar_index > mss_bar and high > post_hi
+    post_hi     := high
+    post_hi_bar := bar_index
+if state == 4 and bar_index > mss_bar and low < post_lo
+    post_lo     := low
+    post_lo_bar := bar_index
 if use_fvg_entry and state == 3 and bar_index > mss_bar
     in_search_window = (bar_index - mss_bar) <= fvg_search_bars
     if na(fvg_top) and in_search_window
@@ -1746,12 +1665,15 @@ if use_fvg_entry and state == 3 and bar_index > mss_bar
         label.delete(ce_lbl)
         ce_lbl := na
         if rearm_ok
-            // Back to hunting for the real structure break, reference re-seeded
-            // at this bar so it tracks the move from here on.
-            state        := 1
-            [org_re_b, org_re_b_bar] = f_seed_pivot_low(ce_scan_bars)
-            mss_ref_bear := na(org_re_b) ? low : org_re_b
-            mss_ref_bar  := na(org_re_b_bar) ? bar_index : org_re_b_bar
+            // Back to hunting for the real structure break. The new CE is
+            // measured from the high printed after the failed break: the
+            // low that push started from.
+            state         := 1
+            ce_ext_hi     := post_hi
+            ce_ext_hi_bar := post_hi_bar
+            [ce_re_b, ce_re_b_bar, ce_re_b_ok] = f_ce_ref(true, bar_index - post_hi_bar)
+            mss_ref_bear := na(ce_re_b) ? low : ce_re_b
+            mss_ref_bar  := na(ce_re_b_bar) ? bar_index : ce_re_b_bar
             line.delete(mss_ref_line)
             label.delete(mss_ref_lbl)
             label.delete(mss_ref_org)
@@ -1788,10 +1710,12 @@ if use_fvg_entry and state == 4 and bar_index > mss_bar
         label.delete(ce_lbl)
         ce_lbl := na
         if rearm_ok
-            state        := 2
-            [org_re_u, org_re_u_bar] = f_seed_pivot_high(ce_scan_bars)
-            mss_ref_bull := na(org_re_u) ? high : org_re_u
-            mss_ref_bar  := na(org_re_u_bar) ? bar_index : org_re_u_bar
+            state         := 2
+            ce_ext_lo     := post_lo
+            ce_ext_lo_bar := post_lo_bar
+            [ce_re_u, ce_re_u_bar, ce_re_u_ok] = f_ce_ref(false, bar_index - post_lo_bar)
+            mss_ref_bull := na(ce_re_u) ? high : ce_re_u
+            mss_ref_bar  := na(ce_re_u_bar) ? bar_index : ce_re_u_bar
             line.delete(mss_ref_line)
             label.delete(mss_ref_lbl)
             label.delete(mss_ref_org)
@@ -1914,6 +1838,118 @@ if long_valid
     fvg_top_line := tmp_fvg_l1
     fvg_bot_line := tmp_fvg_l2
     fvg_lbl := tmp_fvg_lb
+
+// =============================================================
+// CE HISTORY — every structure change, to audit the CE rule
+// =============================================================
+// A continuous structure tracker that uses EXACTLY the rule the entries use
+// (f_ce_ref, same inputs): while price is pushing up it waits for a close
+// below the low that push started from (bearish CE); after that break it
+// flips and waits for a close above the high the decline started from
+// (bullish CE), and so on. Every break inside Asia/London/NY is drawn — a
+// dotted line from the swing the CE sat on to the candle that closed through
+// it, plus a small "CE" — trade or no trade. Execution timeframe (1m) only,
+// like every other operational marker.
+var int   trk_dir     = 0      // -1: rising, waiting for a bearish CE | 1: falling, waiting for a bullish CE
+var float trk_ext     = na     // extreme of the current push
+var int   trk_ext_bar = na
+var float trk_opp     = na     // opposite extreme since trk_ext: where the next push would start
+var int   trk_opp_bar = na
+var float trk_ref     = na     // current CE level
+var int   trk_ref_bar = na
+var line[]  ce_hist_lines  = array.new<line>(0)
+var label[] ce_hist_labels = array.new<label>(0)
+
+f_ce_hist_draw(int x1, float y, bool bear_brk) =>
+    col = bear_brk ? color.new(color.red, 15) : color.new(color.teal, 15)
+    nl  = line.new(x1, y, bar_index, y, color = col, style = line.style_dotted, width = 1)
+    nlb = label.new(bar_index, y, "CE", style = bear_brk ? label.style_label_upper_left : label.style_label_lower_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny)
+    array.push(ce_hist_lines, nl)
+    array.push(ce_hist_labels, nlb)
+    if array.size(ce_hist_lines) > ce_hist_max
+        line.delete(array.shift(ce_hist_lines))
+        label.delete(array.shift(ce_hist_labels))
+    array.size(ce_hist_lines)
+
+// Highest high (want_high) / lowest low since `from_bar`, inclusive, and its bar.
+f_ext_since(int from_bar, bool want_high) =>
+    float v  = want_high ? high : low
+    int   vb = bar_index
+    n = math.min(bar_index - from_bar, 495)
+    if n > 0
+        for i = 1 to n
+            if want_high ? high[i] > v : low[i] < v
+                v  := want_high ? high[i] : low[i]
+                vb := bar_index - i
+    [v, vb]
+
+if ce_hist and is_exec_tf and bar_index > ce_scan_bars
+    if trk_dir == 0
+        trk_dir     := -1
+        trk_ext     := high
+        trk_ext_bar := bar_index
+        trk_opp     := low
+        trk_opp_bar := bar_index
+        [tr0, tr0_bar, tr0_ok] = f_ce_ref(true, 0)
+        trk_ref     := tr0
+        trk_ref_bar := tr0_bar
+    else if trk_dir == -1
+        if not na(trk_ref) and bar_index > trk_ext_bar and close < trk_ref
+            if in_any_sess
+                f_ce_hist_draw(trk_ref_bar, trk_ref, true)
+            // Flip: the decline's extreme so far becomes the new push.
+            if low < trk_opp
+                trk_opp     := low
+                trk_opp_bar := bar_index
+            trk_dir     := 1
+            trk_ext     := trk_opp
+            trk_ext_bar := trk_opp_bar
+            [tf_hi, tf_hi_bar] = f_ext_since(trk_ext_bar, true)
+            trk_opp     := tf_hi
+            trk_opp_bar := tf_hi_bar
+            [tf1, tf1_bar, tf1_ok] = f_ce_ref(false, bar_index - trk_ext_bar)
+            trk_ref     := tf1
+            trk_ref_bar := tf1_bar
+        else if high > trk_ext
+            trk_ext     := high
+            trk_ext_bar := bar_index
+            trk_opp     := low
+            trk_opp_bar := bar_index
+            [tm1, tm1_bar, tm1_ok] = f_ce_ref(true, 0)
+            if tm1_ok and (na(trk_ref_bar) or tm1_bar > trk_ref_bar)
+                trk_ref     := tm1
+                trk_ref_bar := tm1_bar
+        else if low < trk_opp
+            trk_opp     := low
+            trk_opp_bar := bar_index
+    else
+        if not na(trk_ref) and bar_index > trk_ext_bar and close > trk_ref
+            if in_any_sess
+                f_ce_hist_draw(trk_ref_bar, trk_ref, false)
+            if high > trk_opp
+                trk_opp     := high
+                trk_opp_bar := bar_index
+            trk_dir     := -1
+            trk_ext     := trk_opp
+            trk_ext_bar := trk_opp_bar
+            [tf_lo, tf_lo_bar] = f_ext_since(trk_ext_bar, false)
+            trk_opp     := tf_lo
+            trk_opp_bar := tf_lo_bar
+            [tf2, tf2_bar, tf2_ok] = f_ce_ref(true, bar_index - trk_ext_bar)
+            trk_ref     := tf2
+            trk_ref_bar := tf2_bar
+        else if low < trk_ext
+            trk_ext     := low
+            trk_ext_bar := bar_index
+            trk_opp     := high
+            trk_opp_bar := bar_index
+            [tm2, tm2_bar, tm2_ok] = f_ce_ref(false, 0)
+            if tm2_ok and (na(trk_ref_bar) or tm2_bar > trk_ref_bar)
+                trk_ref     := tm2
+                trk_ref_bar := tm2_bar
+        else if high > trk_opp
+            trk_opp     := high
+            trk_opp_bar := bar_index
 
 // =============================================================
 // VISUALS — session range boxes (Asia/London/NY), instead of a flat
@@ -2182,17 +2218,22 @@ if fire_um
 
 
 
-// Delete all managed drawings from previous bar
-n_ml = array.size(managed_poi_lines)
-if n_ml > 0
-    for i = 0 to n_ml - 1
-        line.delete(array.get(managed_poi_lines, i))
-array.clear(managed_poi_lines)
-n_mlb = array.size(managed_poi_labels)
-if n_mlb > 0
-    for i = 0 to n_mlb - 1
-        label.delete(array.get(managed_poi_labels, i))
-array.clear(managed_poi_labels)
+// The POI lines are rebuilt from scratch, and only the last bar's set is ever
+// visible — so they are built ONLY on the last bar (every realtime tick is
+// the last bar). Building them on every historical bar was the single
+// biggest cost of the script: the whole merge/sort/draw pass thousands of
+// times for drawings that were deleted on the very next bar.
+if barstate.islast
+    n_ml = array.size(managed_poi_lines)
+    if n_ml > 0
+        for i = 0 to n_ml - 1
+            line.delete(array.get(managed_poi_lines, i))
+    array.clear(managed_poi_lines)
+    n_mlb = array.size(managed_poi_labels)
+    if n_mlb > 0
+        for i = 0 to n_mlb - 1
+            label.delete(array.get(managed_poi_labels, i))
+    array.clear(managed_poi_labels)
 
 // A swept level that triggered the CURRENT active sweep->MSS->entry cycle
 // turns green instead of just disappearing, and stays visible
@@ -2226,7 +2267,7 @@ imb_line_faded = color.new(imb_line_col, imb_line_transp)
 imb_text_solid = color.new(imb_line_col, 0)
 active_col      = color.new(color.lime, 10)
 
-if show_levels
+if show_levels and barstate.islast
     poi_px  = array.new_float(0)
     poi_nm  = array.new_string(0)
     poi_cl  = array.new<color>(0)   // line color
@@ -2352,7 +2393,7 @@ if show_levels
                 px = array.get(htf_b1h_near_arr, i)
                 if f_imb_in_rng(px) and array.get(b1h_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "1H FVG Bear")
+                    array.push(poi_nm, "1H")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 58)
@@ -2367,7 +2408,7 @@ if show_levels
                 px = array.get(htf_u1h_near_arr, i)
                 if f_imb_in_rng(px) and array.get(u1h_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "1H FVG Bull")
+                    array.push(poi_nm, "1H")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 59)
@@ -2378,7 +2419,7 @@ if show_levels
         // Swept-record: the most recently touched 1H gap on each side,
         // frozen for the rest of this session — same lifecycle every other
         // POI type already gets, previously missing entirely for HTF gaps.
-        [show_b1h_sw, nm_b1h_sw, act_b1h_sw, frz_b1h_sw, end_b1h_sw] = f_poi_entry(htf_b1h_swept_px, not na(htf_b1h_swept_px), htf_b1h_swept_t, htf_b1h_swept_s, "1H FVG Bear")
+        [show_b1h_sw, nm_b1h_sw, act_b1h_sw, frz_b1h_sw, end_b1h_sw] = f_poi_entry(htf_b1h_swept_px, not na(htf_b1h_swept_px), htf_b1h_swept_t, htf_b1h_swept_s, "1H")
         if show_b1h_sw
             array.push(poi_px, htf_b1h_swept_px)
             array.push(poi_nm, nm_b1h_sw)
@@ -2389,7 +2430,7 @@ if show_levels
             array.push(poi_ext, not frz_b1h_sw)
             array.push(poi_end, end_b1h_sw)
             array.push(poi_hi, true)
-        [show_u1h_sw, nm_u1h_sw, act_u1h_sw, frz_u1h_sw, end_u1h_sw] = f_poi_entry(htf_u1h_swept_px, not na(htf_u1h_swept_px), htf_u1h_swept_t, htf_u1h_swept_s, "1H FVG Bull")
+        [show_u1h_sw, nm_u1h_sw, act_u1h_sw, frz_u1h_sw, end_u1h_sw] = f_poi_entry(htf_u1h_swept_px, not na(htf_u1h_swept_px), htf_u1h_swept_t, htf_u1h_swept_s, "1H")
         if show_u1h_sw
             array.push(poi_px, htf_u1h_swept_px)
             array.push(poi_nm, nm_u1h_sw)
@@ -2408,7 +2449,7 @@ if show_levels
                 px = array.get(htf_b4h_near_arr, i)
                 if f_imb_in_rng(px) and array.get(b4h_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "4H FVG Bear")
+                    array.push(poi_nm, "4H")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 56)
@@ -2423,7 +2464,7 @@ if show_levels
                 px = array.get(htf_u4h_near_arr, i)
                 if f_imb_in_rng(px) and array.get(u4h_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "4H FVG Bull")
+                    array.push(poi_nm, "4H")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 57)
@@ -2431,7 +2472,7 @@ if show_levels
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
-        [show_b4h_sw, nm_b4h_sw, act_b4h_sw, frz_b4h_sw, end_b4h_sw] = f_poi_entry(htf_b4h_swept_px, not na(htf_b4h_swept_px), htf_b4h_swept_t, htf_b4h_swept_s, "4H FVG Bear")
+        [show_b4h_sw, nm_b4h_sw, act_b4h_sw, frz_b4h_sw, end_b4h_sw] = f_poi_entry(htf_b4h_swept_px, not na(htf_b4h_swept_px), htf_b4h_swept_t, htf_b4h_swept_s, "4H")
         if show_b4h_sw
             array.push(poi_px, htf_b4h_swept_px)
             array.push(poi_nm, nm_b4h_sw)
@@ -2442,7 +2483,7 @@ if show_levels
             array.push(poi_ext, not frz_b4h_sw)
             array.push(poi_end, end_b4h_sw)
             array.push(poi_hi, true)
-        [show_u4h_sw, nm_u4h_sw, act_u4h_sw, frz_u4h_sw, end_u4h_sw] = f_poi_entry(htf_u4h_swept_px, not na(htf_u4h_swept_px), htf_u4h_swept_t, htf_u4h_swept_s, "4H FVG Bull")
+        [show_u4h_sw, nm_u4h_sw, act_u4h_sw, frz_u4h_sw, end_u4h_sw] = f_poi_entry(htf_u4h_swept_px, not na(htf_u4h_swept_px), htf_u4h_swept_t, htf_u4h_swept_s, "4H")
         if show_u4h_sw
             array.push(poi_px, htf_u4h_swept_px)
             array.push(poi_nm, nm_u4h_sw)
@@ -2461,7 +2502,7 @@ if show_levels
                 px = array.get(htf_bd_near_arr, i)
                 if f_imb_in_rng(px) and array.get(bd_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "D FVG Bear")
+                    array.push(poi_nm, "D")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 54)
@@ -2476,7 +2517,7 @@ if show_levels
                 px = array.get(htf_ud_near_arr, i)
                 if f_imb_in_rng(px) and array.get(ud_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "D FVG Bull")
+                    array.push(poi_nm, "D")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 55)
@@ -2484,7 +2525,7 @@ if show_levels
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
-        [show_bd_sw, nm_bd_sw, act_bd_sw, frz_bd_sw, end_bd_sw] = f_poi_entry(htf_bd_swept_px, not na(htf_bd_swept_px), htf_bd_swept_t, htf_bd_swept_s, "D FVG Bear")
+        [show_bd_sw, nm_bd_sw, act_bd_sw, frz_bd_sw, end_bd_sw] = f_poi_entry(htf_bd_swept_px, not na(htf_bd_swept_px), htf_bd_swept_t, htf_bd_swept_s, "D")
         if show_bd_sw
             array.push(poi_px, htf_bd_swept_px)
             array.push(poi_nm, nm_bd_sw)
@@ -2495,7 +2536,7 @@ if show_levels
             array.push(poi_ext, not frz_bd_sw)
             array.push(poi_end, end_bd_sw)
             array.push(poi_hi, true)
-        [show_ud_sw, nm_ud_sw, act_ud_sw, frz_ud_sw, end_ud_sw] = f_poi_entry(htf_ud_swept_px, not na(htf_ud_swept_px), htf_ud_swept_t, htf_ud_swept_s, "D FVG Bull")
+        [show_ud_sw, nm_ud_sw, act_ud_sw, frz_ud_sw, end_ud_sw] = f_poi_entry(htf_ud_swept_px, not na(htf_ud_swept_px), htf_ud_swept_t, htf_ud_swept_s, "D")
         if show_ud_sw
             array.push(poi_px, htf_ud_swept_px)
             array.push(poi_nm, nm_ud_sw)
@@ -2514,7 +2555,7 @@ if show_levels
                 px = array.get(htf_bw_near_arr, i)
                 if f_imb_in_rng(px) and array.get(bw_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "W FVG Bear")
+                    array.push(poi_nm, "W")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 52)
@@ -2529,7 +2570,7 @@ if show_levels
                 px = array.get(htf_uw_near_arr, i)
                 if f_imb_in_rng(px) and array.get(uw_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "W FVG Bull")
+                    array.push(poi_nm, "W")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 53)
@@ -2537,7 +2578,7 @@ if show_levels
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
-        [show_bw_sw, nm_bw_sw, act_bw_sw, frz_bw_sw, end_bw_sw] = f_poi_entry(htf_bw_swept_px, not na(htf_bw_swept_px), htf_bw_swept_t, htf_bw_swept_s, "W FVG Bear")
+        [show_bw_sw, nm_bw_sw, act_bw_sw, frz_bw_sw, end_bw_sw] = f_poi_entry(htf_bw_swept_px, not na(htf_bw_swept_px), htf_bw_swept_t, htf_bw_swept_s, "W")
         if show_bw_sw
             array.push(poi_px, htf_bw_swept_px)
             array.push(poi_nm, nm_bw_sw)
@@ -2548,7 +2589,7 @@ if show_levels
             array.push(poi_ext, not frz_bw_sw)
             array.push(poi_end, end_bw_sw)
             array.push(poi_hi, true)
-        [show_uw_sw, nm_uw_sw, act_uw_sw, frz_uw_sw, end_uw_sw] = f_poi_entry(htf_uw_swept_px, not na(htf_uw_swept_px), htf_uw_swept_t, htf_uw_swept_s, "W FVG Bull")
+        [show_uw_sw, nm_uw_sw, act_uw_sw, frz_uw_sw, end_uw_sw] = f_poi_entry(htf_uw_swept_px, not na(htf_uw_swept_px), htf_uw_swept_t, htf_uw_swept_s, "W")
         if show_uw_sw
             array.push(poi_px, htf_uw_swept_px)
             array.push(poi_nm, nm_uw_sw)
@@ -2567,7 +2608,7 @@ if show_levels
                 px = array.get(htf_bm_near_arr, i)
                 if f_imb_in_rng(px) and array.get(bm_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "MN FVG Bear")
+                    array.push(poi_nm, "MN")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 50)
@@ -2582,7 +2623,7 @@ if show_levels
                 px = array.get(htf_um_near_arr, i)
                 if f_imb_in_rng(px) and array.get(um_outer, i)
                     array.push(poi_px, px)
-                    array.push(poi_nm, "MN FVG Bull")
+                    array.push(poi_nm, "MN")
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 51)
@@ -2590,7 +2631,7 @@ if show_levels
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
-        [show_bm_sw, nm_bm_sw, act_bm_sw, frz_bm_sw, end_bm_sw] = f_poi_entry(htf_bm_swept_px, not na(htf_bm_swept_px), htf_bm_swept_t, htf_bm_swept_s, "MN FVG Bear")
+        [show_bm_sw, nm_bm_sw, act_bm_sw, frz_bm_sw, end_bm_sw] = f_poi_entry(htf_bm_swept_px, not na(htf_bm_swept_px), htf_bm_swept_t, htf_bm_swept_s, "MN")
         if show_bm_sw
             array.push(poi_px, htf_bm_swept_px)
             array.push(poi_nm, nm_bm_sw)
@@ -2601,7 +2642,7 @@ if show_levels
             array.push(poi_ext, not frz_bm_sw)
             array.push(poi_end, end_bm_sw)
             array.push(poi_hi, true)
-        [show_um_sw, nm_um_sw, act_um_sw, frz_um_sw, end_um_sw] = f_poi_entry(htf_um_swept_px, not na(htf_um_swept_px), htf_um_swept_t, htf_um_swept_s, "MN FVG Bull")
+        [show_um_sw, nm_um_sw, act_um_sw, frz_um_sw, end_um_sw] = f_poi_entry(htf_um_swept_px, not na(htf_um_swept_px), htf_um_swept_t, htf_um_swept_s, "MN")
         if show_um_sw
             array.push(poi_px, htf_um_swept_px)
             array.push(poi_nm, nm_um_sw)
@@ -2659,8 +2700,9 @@ if show_levels
                 if not array.get(used_flags, sj) and array.get(poi_ext, sj) == g_ext
                     prj = array.get(poi_pr, sj)
                     nmj = array.get(poi_nm, sj)
+                    has_nm = str.contains(" · " + g_nm + " · ", " · " + nmj + " · ")
                     if prj < g_pr
-                        g_nm  := nmj + " + " + g_nm
+                        g_nm  := has_nm ? g_nm : nmj + " · " + g_nm
                         g_px  := pj
                         g_cl  := array.get(poi_cl, sj)
                         g_tx  := array.get(poi_tx, sj)
@@ -2668,8 +2710,8 @@ if show_levels
                         g_bar := array.get(poi_bar, sj)
                         g_end := array.get(poi_end, sj)
                         g_hi  := array.get(poi_hi, sj)
-                    else
-                        g_nm := g_nm + " + " + nmj
+                    else if not has_nm
+                        g_nm := g_nm + " · " + nmj
                     array.set(used_flags, sj, true)
                 jj := jj + 1
 
@@ -2714,7 +2756,13 @@ if show_levels
                     x2 = math.max(array.get(gr_end, gi), x1 + 1)
                     d_hi = array.get(gr_hi, gi)
                     new_l  = line.new(x1, d_px, x2, d_px, xloc = xloc.bar_time, extend = d_ext ? extend.right : extend.none, color = array.get(gr_cl, gi), style = line.style_solid, width = 1)
-                    new_lb = label.new(x2, d_px, array.get(gr_nm, gi), xloc = xloc.bar_time, style = d_hi ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = array.get(gr_tx, gi), size = size.small)
+                    // Live lines: the label sits on the line a few candles to
+                    // the RIGHT of the last candle (the chart's right margin),
+                    // never on top of price. Frozen (swept) lines: the label
+                    // ends where the line ends.
+                    lb_x   = d_ext ? time + (lbl_off_bars + 1) * chart_sec * 1000 : x2
+                    lb_sty = d_ext ? (d_hi ? label.style_label_lower_left : label.style_label_upper_left) : (d_hi ? label.style_label_lower_right : label.style_label_upper_right)
+                    new_lb = label.new(lb_x, d_px, array.get(gr_nm, gi), xloc = xloc.bar_time, style = lb_sty, color = color.new(color.black, 100), textcolor = array.get(gr_tx, gi), size = size.small)
                     array.push(managed_poi_lines,  new_l)
                     array.push(managed_poi_labels, new_lb)
 
