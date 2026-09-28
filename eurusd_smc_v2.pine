@@ -1674,12 +1674,18 @@ if use_fvg_entry and state == 3 and bar_index > mss_bar
             [ce_re_b, ce_re_b_bar, ce_re_b_ok] = f_ce_ref(true, bar_index - post_hi_bar)
             mss_ref_bear := na(ce_re_b) ? low : ce_re_b
             mss_ref_bar  := na(ce_re_b_bar) ? bar_index : ce_re_b_bar
-            line.delete(mss_ref_line)
-            label.delete(mss_ref_lbl)
-            label.delete(mss_ref_org)
-            mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bear, bar_index + 1, mss_ref_bear, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
-            mss_ref_lbl  := label.new(bar_index, mss_ref_bear, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
-            mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bear, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
+            // Already broken (price closed below it since): not a new CE to
+            // wait for — the cycle is over, not re-broken on the next bar.
+            if mss_ref_bear >= close
+                state := 0
+                active_sweep_px := na
+            if state == 1
+                line.delete(mss_ref_line)
+                label.delete(mss_ref_lbl)
+                label.delete(mss_ref_org)
+                mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bear, bar_index + 1, mss_ref_bear, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
+                mss_ref_lbl  := label.new(bar_index, mss_ref_bear, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
+                mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bear, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
         else
             state := 0
             active_sweep_px := na
@@ -1716,12 +1722,16 @@ if use_fvg_entry and state == 4 and bar_index > mss_bar
             [ce_re_u, ce_re_u_bar, ce_re_u_ok] = f_ce_ref(false, bar_index - post_lo_bar)
             mss_ref_bull := na(ce_re_u) ? high : ce_re_u
             mss_ref_bar  := na(ce_re_u_bar) ? bar_index : ce_re_u_bar
-            line.delete(mss_ref_line)
-            label.delete(mss_ref_lbl)
-            label.delete(mss_ref_org)
-            mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bull, bar_index + 1, mss_ref_bull, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
-            mss_ref_lbl  := label.new(bar_index, mss_ref_bull, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
-            mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bull, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
+            if mss_ref_bull <= close
+                state := 0
+                active_sweep_px := na
+            if state == 2
+                line.delete(mss_ref_line)
+                label.delete(mss_ref_lbl)
+                label.delete(mss_ref_org)
+                mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bull, bar_index + 1, mss_ref_bull, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
+                mss_ref_lbl  := label.new(bar_index, mss_ref_bull, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
+                mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bull, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
         else
             state := 0
             active_sweep_px := na

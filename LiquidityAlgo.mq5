@@ -592,6 +592,13 @@ int OnInit()
    ArrayResize(swlHist, 0);
    lastSeenFormingBar = 0;
    lastProcessedM1Bar = 0;
+   // Seed the Wilder ATR from the last 14 closed M1 bars so the CE's ATR
+   // floor matches Pine's ta.atr from the first processed bar.
+   for(int i = 15; i >= 1; i--)
+     {
+      M1Bar b;
+      if(GetM1(i, b)) UpdateAtr(b);
+     }
    return(INIT_SUCCEEDED);
   }
 
