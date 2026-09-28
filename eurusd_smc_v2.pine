@@ -94,7 +94,7 @@ mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the 
 ce_leg_pct   = input.float(25.0, "CE: Min Pullback (% of final leg)", 5.0, 100.0, 5.0, group = GMSS, tooltip = "CE = the swing that STARTED the final leg into the liquidity (short: the low the last push up began from; long: the high the last push down began from). A pullback only counts as the start of a leg if it is at least this % of the leg that followed it, so small pauses inside one push are ignored.")
 ce_min_atr   = input.float(1.0,  "CE: Min Pullback (x ATR 14)", 0.0, 5.0, 0.1, group = GMSS, tooltip = "Absolute floor for the same pullback, in ATR(14) of the chart: stops 1-2 candle micro-dips from becoming the CE.")
 ce_scan_bars = input.int(60,     "CE: Lookback (candles)", 10, 300, group = GMSS, tooltip = "How far back from the extreme the start of the final leg is searched. If no qualifying pullback exists in this window (one straight impulse), the CE is the lowest low (short) / highest high (long) of the window.")
-ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every structure change (CE) the engine detects inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rule the entries use — to audit where the CE is placed.")
+ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
 var string GFVG = "FVG / Imbalance"
@@ -1039,6 +1039,12 @@ else if ae_done
 //   - any post-sweep pivot (the old ratchet): a pullback AFTER the extreme,
 //     which is not the swing that created it — the CE sat on a minor
 //     internal high/low and fired early.
+//
+// CLOSE RULE (the user's backtested edge): structure only moves on a CLOSE.
+// A new extreme exists only when a candle CLOSES beyond the previous one; a
+// wick that pokes beyond it and closes back inside is annulled — it moves
+// nothing, and the old extreme stays the level. Applied wherever an extreme
+// is tracked below (entry cycle and CE history).
 atr_ce = ta.atr(14)
 
 // [level, bar_index, found] of the swing that started the final leg into the
@@ -1046,17 +1052,20 @@ atr_ce = ta.atr(14)
 // setup) and the CE is a low; otherwise the mirror. found = false means no
 // pullback qualified inside the lookback and the level is the window's
 // deepest point (one straight impulse) — usable as a starting CE, never as
-// a relocation.
+// a relocation. The search starts at the candle BEFORE the extreme: the
+// extreme candle's own opposite wick (e.g. the high of the hammer that made
+// the low) is part of the reversal, never the start of the leg — using it
+// produced one-candle CEs with no visible reason.
 f_ce_ref(bool short_side, int e_off) =>
     float res     = na
     int   res_bar = na
     bool  found   = false
     lim = math.min(ce_scan_bars, 495 - e_off)
-    if e_off >= 0 and lim >= 2
+    if e_off >= 0 and lim >= 3
         float ext = short_side ? high[e_off] : low[e_off]
-        float m   = short_side ? low[e_off]  : high[e_off]
-        int   m_i = e_off
-        for i = e_off + 1 to e_off + lim
+        float m   = short_side ? low[e_off + 1] : high[e_off + 1]
+        int   m_i = e_off + 1
+        for i = e_off + 2 to e_off + lim
             thr = math.max(math.abs(ext - m) * ce_leg_pct / 100.0, ce_min_atr * nz(atr_ce))
             cm  = short_side ? high[i] - m : m - low[i]
             if cm > 0 and cm >= thr
@@ -1505,8 +1514,9 @@ if sess_carried_over
 bear_mss = state == 1 and bar_index > sweep_bar and not na(mss_ref_bear) and close < mss_ref_bear
 bull_mss = state == 2 and bar_index > sweep_bar and not na(mss_ref_bull) and close > mss_ref_bull
 
-// WHEN THE CE MOVES. Only when price prints a NEW extreme of the move (a
-// higher high in a short setup, a lower low in a long one): that new push has
+// WHEN THE CE MOVES. Only when a candle CLOSES beyond the current extreme of
+// the move (a close above it in a short setup, below it in a long one — a
+// wick beyond it is annulled, see CLOSE RULE): that new push has
 // its own starting swing, recomputed with f_ce_ref from the new extreme. The
 // new level is adopted only if the pullback it found is MORE RECENT than the
 // current CE (the reference never jumps back in time to an older, deeper
@@ -1521,7 +1531,7 @@ bull_mss = state == 2 and bar_index > sweep_bar and not na(mss_ref_bull) and clo
 if state == 1 and not bear_mss
     if high > sweep_hi
         sweep_hi := high
-    if high > ce_ext_hi
+    if close > ce_ext_hi
         ce_ext_hi     := high
         ce_ext_hi_bar := bar_index
         [ce_mv_b, ce_mv_b_bar, ce_mv_b_ok] = f_ce_ref(true, 0)
@@ -1540,7 +1550,7 @@ if state == 1 and not bear_mss
 if state == 2 and not bull_mss
     if low < sweep_lo
         sweep_lo := low
-    if low < ce_ext_lo
+    if close < ce_ext_lo
         ce_ext_lo     := low
         ce_ext_lo_bar := bar_index
         [ce_mv_u, ce_mv_u_bar, ce_mv_u_ok] = f_ce_ref(false, 0)
@@ -1630,10 +1640,10 @@ if bull_mss
 // take the trade. Re-arming keeps it hunting until either a valid entry
 // appears or the whole cycle times out mss_max_bars after the sweep.
 rearm_ok = (bar_index - sweep_bar) <= mss_max_bars
-if state == 3 and bar_index > mss_bar and high > post_hi
+if state == 3 and bar_index > mss_bar and close > post_hi
     post_hi     := high
     post_hi_bar := bar_index
-if state == 4 and bar_index > mss_bar and low < post_lo
+if state == 4 and bar_index > mss_bar and close < post_lo
     post_lo     := low
     post_lo_bar := bar_index
 if use_fvg_entry and state == 3 and bar_index > mss_bar
@@ -1852,20 +1862,24 @@ if long_valid
 // =============================================================
 // CE HISTORY — every structure change, to audit the CE rule
 // =============================================================
-// A continuous structure tracker that uses EXACTLY the rule the entries use
-// (f_ce_ref, same inputs): while price is pushing up it waits for a close
-// below the low that push started from (bearish CE); after that break it
-// flips and waits for a close above the high the decline started from
-// (bullish CE), and so on. Every break inside Asia/London/NY is drawn — a
-// dotted line from the swing the CE sat on to the candle that closed through
-// it, plus a small "CE" — trade or no trade. Execution timeframe (1m) only,
-// like every other operational marker.
+// A continuous structure tracker that uses EXACTLY the rules the entries use
+// (f_ce_ref + CLOSE RULE, same inputs). A CE is drawn every time a candle
+// CLOSES beyond structure — a wick beyond it is annulled and draws nothing:
+//   - reversal: while price pushes up, a close below the low that push
+//     started from (bearish CE); the tracker then flips and waits for a close
+//     above the high the decline started from (bullish CE), and so on;
+//   - continuation: a close beyond the last valid extreme after a real
+//     pullback (the move surpassed the previous one with a candle). Drawn at
+//     that previous extreme — the level that was actually broken, not the
+//     wicks that poked through it earlier without closing.
+// Each CE inside Asia/London/NY is drawn — a dotted line from the swing it
+// sat on to the candle that closed through it, plus a small "CE" — trade or
+// no trade. Execution timeframe (1m) only, like every other operational
+// marker.
 var int   trk_dir     = 0      // -1: rising, waiting for a bearish CE | 1: falling, waiting for a bullish CE
-var float trk_ext     = na     // extreme of the current push
+var float trk_ext     = na     // last valid extreme of the move (moved only by closes beyond it)
 var int   trk_ext_bar = na
-var float trk_opp     = na     // opposite extreme since trk_ext: where the next push would start
-var int   trk_opp_bar = na
-var float trk_ref     = na     // current CE level
+var float trk_ref     = na     // current CE level (start of the final leg into trk_ext)
 var int   trk_ref_bar = na
 var line[]  ce_hist_lines  = array.new<line>(0)
 var label[] ce_hist_labels = array.new<label>(0)
@@ -1881,85 +1895,62 @@ f_ce_hist_draw(int x1, float y, bool bear_brk) =>
         label.delete(array.shift(ce_hist_labels))
     array.size(ce_hist_lines)
 
-// Highest high (want_high) / lowest low since `from_bar`, inclusive, and its bar.
-f_ext_since(int from_bar, bool want_high) =>
-    float v  = want_high ? high : low
-    int   vb = bar_index
-    n = math.min(bar_index - from_bar, 495)
-    if n > 0
-        for i = 1 to n
-            if want_high ? high[i] > v : low[i] < v
-                v  := want_high ? high[i] : low[i]
-                vb := bar_index - i
-    [v, vb]
-
 if ce_hist and is_exec_tf and bar_index > ce_scan_bars
     if trk_dir == 0
         trk_dir     := -1
         trk_ext     := high
         trk_ext_bar := bar_index
-        trk_opp     := low
-        trk_opp_bar := bar_index
         [tr0, tr0_bar, tr0_ok] = f_ce_ref(true, 0)
         trk_ref     := tr0
         trk_ref_bar := tr0_bar
     else if trk_dir == -1
         if not na(trk_ref) and bar_index > trk_ext_bar and close < trk_ref
+            // Reversal (bearish CE). The new move's extreme is this candle's
+            // own low: earlier wicks below the level never closed there.
             if in_any_sess
                 f_ce_hist_draw(trk_ref_bar, trk_ref, true)
-            // Flip: the decline's extreme so far becomes the new push.
-            if low < trk_opp
-                trk_opp     := low
-                trk_opp_bar := bar_index
             trk_dir     := 1
-            trk_ext     := trk_opp
-            trk_ext_bar := trk_opp_bar
-            [tf_hi, tf_hi_bar] = f_ext_since(trk_ext_bar, true)
-            trk_opp     := tf_hi
-            trk_opp_bar := tf_hi_bar
-            [tf1, tf1_bar, tf1_ok] = f_ce_ref(false, bar_index - trk_ext_bar)
+            trk_ext     := low
+            trk_ext_bar := bar_index
+            [tf1, tf1_bar, tf1_ok] = f_ce_ref(false, 0)
             trk_ref     := tf1
             trk_ref_bar := tf1_bar
-        else if high > trk_ext
+        else if close > trk_ext
+            // New high by CLOSE. If a real pullback separates it from the
+            // previous high, that high was structure and this candle broke
+            // it: continuation CE at the previous high.
+            old_ext     = trk_ext
+            old_ext_bar = trk_ext_bar
             trk_ext     := high
             trk_ext_bar := bar_index
-            trk_opp     := low
-            trk_opp_bar := bar_index
             [tm1, tm1_bar, tm1_ok] = f_ce_ref(true, 0)
             if tm1_ok and (na(trk_ref_bar) or tm1_bar > trk_ref_bar)
                 trk_ref     := tm1
                 trk_ref_bar := tm1_bar
-        else if low < trk_opp
-            trk_opp     := low
-            trk_opp_bar := bar_index
+                if in_any_sess
+                    f_ce_hist_draw(old_ext_bar, old_ext, false)
     else
         if not na(trk_ref) and bar_index > trk_ext_bar and close > trk_ref
+            // Reversal (bullish CE); mirror.
             if in_any_sess
                 f_ce_hist_draw(trk_ref_bar, trk_ref, false)
-            if high > trk_opp
-                trk_opp     := high
-                trk_opp_bar := bar_index
             trk_dir     := -1
-            trk_ext     := trk_opp
-            trk_ext_bar := trk_opp_bar
-            [tf_lo, tf_lo_bar] = f_ext_since(trk_ext_bar, false)
-            trk_opp     := tf_lo
-            trk_opp_bar := tf_lo_bar
-            [tf2, tf2_bar, tf2_ok] = f_ce_ref(true, bar_index - trk_ext_bar)
+            trk_ext     := high
+            trk_ext_bar := bar_index
+            [tf2, tf2_bar, tf2_ok] = f_ce_ref(true, 0)
             trk_ref     := tf2
             trk_ref_bar := tf2_bar
-        else if low < trk_ext
+        else if close < trk_ext
+            old_ext_d     = trk_ext
+            old_ext_bar_d = trk_ext_bar
             trk_ext     := low
             trk_ext_bar := bar_index
-            trk_opp     := high
-            trk_opp_bar := bar_index
             [tm2, tm2_bar, tm2_ok] = f_ce_ref(false, 0)
             if tm2_ok and (na(trk_ref_bar) or tm2_bar > trk_ref_bar)
                 trk_ref     := tm2
                 trk_ref_bar := tm2_bar
-        else if high > trk_opp
-            trk_opp     := high
-            trk_opp_bar := bar_index
+                if in_any_sess
+                    f_ce_hist_draw(old_ext_bar_d, old_ext_d, true)
 
 // =============================================================
 // VISUALS — session range boxes (Asia/London/NY), instead of a flat

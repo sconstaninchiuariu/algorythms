@@ -25,7 +25,8 @@
 //|       began from (short) / the high the last push down began from |
 //|       (long). A pullback counts as a leg start only if it is at   |
 //|       least CeLegPct % of the leg that followed AND CeMinAtr x    |
-//|       ATR14. It moves only when price prints a new extreme whose  |
+//|       ATR14. It moves only when a candle CLOSES beyond the current |
+//|       extreme (wicks beyond it are annulled) and the new push's   |
 //|       own starting swing is more recent (see CeRef).              |
 //|    3. Price closing back through the CE level confirms the break |
 //|       -> a PENDING entry (state 3/4): SL/TP are already frozen to |
@@ -294,12 +295,14 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
    MqlRates r[];
    ArraySetAsSeries(r, true);
    int got = CopyRates(_Symbol, PERIOD_M1, 0, eShift + CeScanBars + 1, r);
-   if(got <= eShift + 2) return -1;
+   if(got <= eShift + 3) return -1;
    double ext = isBear ? r[eShift].high : r[eShift].low;
-   double m   = isBear ? r[eShift].low  : r[eShift].high;
-   datetime mt = r[eShift].time;
+   // The search starts at the candle BEFORE the extreme: the extreme candle's
+   // own opposite wick is part of the reversal, never the start of the leg.
+   double m   = isBear ? r[eShift + 1].low  : r[eShift + 1].high;
+   datetime mt = r[eShift + 1].time;
    int found = 0;
-   for(int i = eShift + 1; i < got; i++)
+   for(int i = eShift + 2; i < got; i++)
      {
       double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
       double cm  = isBear ? r[i].high - m : m - r[i].low;
@@ -497,7 +500,9 @@ void ProcessNewM1Bar(const M1Bar &bar)
       if(!bearMss)
         {
          if(bar.h > sweepHi) sweepHi = bar.h;
-         if(bar.h > ceExtHi)
+         // CLOSE RULE: the extreme moves only when a candle CLOSES beyond it;
+         // a wick beyond it that closes back inside is annulled.
+         if(bar.c > ceExtHi)
            {
             ceExtHi = bar.h;
             double lv = 0; datetime lt = 0;
@@ -511,7 +516,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
       if(!bullMss)
         {
          if(bar.l < sweepLo) sweepLo = bar.l;
-         if(bar.l < ceExtLo)
+         if(bar.c < ceExtLo)
            {
             ceExtLo = bar.l;
             double lv = 0; datetime lt = 0;
