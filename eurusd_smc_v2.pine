@@ -97,6 +97,7 @@ ce_scan_bars = input.int(60,     "CE: Lookback (candles)", 10, 300, group = GMSS
 ce_cont_bars = input.int(8,      "Continuation CE: min candles since the broken swing", 2, 100, group = GMSS, tooltip = "Audit layer only. A CE in the direction of the trend (a close beyond the last extreme after a pullback) is drawn only if that extreme is at least this many candles old ...")
 ce_cont_atr  = input.float(2.0,  "Continuation CE: min pullback (x ATR 14)", 0.5, 10.0, 0.1, group = GMSS, tooltip = "... and the pullback between it and the break was at least this many ATR. Micro-swings inside a trend (a 2-5 candle bounce) are not structure. Reversal CEs are not affected.")
 ce_disp_atr  = input.float(0.75, "CE: Displacement candle (min body x ATR 14)", 0.1, 3.0, 0.05, group = GMSS, tooltip = "When the candle that made the extreme is itself a strong candle in the push direction (a big green candle that dips and closes above the previous high, for a short setup), its own low IS the start of the move and can be the CE (e.g. a green candle that went a little deeper than the red one before it). Ordinary small candles never count: their own wick is part of the reversal, not the start of the leg.")
+ce_leg_bars  = input.int(3,      "Continuation CE: min candles of the counter-move", 1, 30, group = GMSS, tooltip = "Audit layer only. A counter-move only counts as a leg (whose origin, when broken, is a CE) if at least this many candles separate the extreme from the bottom of the pullback. One big candle against a trend is not a leg: breaking its origin is just the trend making a new high/low, not a change of structure.")
 ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
@@ -270,8 +271,10 @@ f_cross_t(float e, bool is_high, int since) =>
 
 // Session key from a timestamp (FX day stamp * 10 + bucket), used for the
 // "frozen until the end of the session it was swept in" rule. Buckets: 1 Asia,
-// 2 gap, 3 London, 4 gap, 5 New York, 6 after NY. Purely clock-based, so the
-// same sweep maps to the same session on every chart timeframe.
+// 3 London, 5 New York; time between sessions counts as the NEXT session (the
+// gap before London is London, the gap before NY is New York, after NY is
+// tomorrow's Asia). Purely clock-based, so the same sweep maps to the same
+// session on every chart timeframe.
 f_sess_key(int t) =>
     int res = na
     if not na(t)
@@ -279,7 +282,15 @@ f_sess_key(int t) =>
         mins = hh * 60 + minute(t, "UTC+2")
         d    = year(t, "UTC+2") * 10000 + month(t, "UTC+2") * 100 + dayofmonth(t, "UTC+2")
         asia = kz_asia_open <= kz_asia_close ? (hh >= kz_asia_open and hh < kz_asia_close) : (hh >= kz_asia_open or hh < kz_asia_close)
-        b = asia ? 1 : mins < kz_lon_open * 60 ? 2 : mins < kz_lon_close * 60 ? 3 : mins < kz_ny_open * 60 ? 4 : mins < kz_ny_close_h * 60 + kz_ny_close_m ? 5 : 6
+        // Time between sessions belongs to the NEXT session: a level swept at
+        // 13:45 is still "just liquidated" when New York opens and must stay
+        // on the chart through that session (it used to vanish at the open,
+        // which reads as "nothing was liquidated"). London-gap -> London,
+        // NY-gap -> New York, after NY -> tomorrow's Asia.
+        b = asia ? 1 : mins < kz_lon_close * 60 ? 3 : mins < kz_ny_close_h * 60 + kz_ny_close_m ? 5 : 6
+        if b == 6
+            d := year(t + 86400000, "UTC+2") * 10000 + month(t + 86400000, "UTC+2") * 100 + dayofmonth(t + 86400000, "UTC+2")
+            b := 1
         res := d * 10 + b
     res
 
@@ -1115,15 +1126,19 @@ f_ce_ref(bool short_side, int e_off) =>
 // Depth of the pullback between an extreme (bar since_bar) and now: how far
 // price fell from it (want_low) / rose from it, over the candles in between.
 // Bounded, and only evaluated on the rare events that need it.
+// Returns [depth, bars from the extreme's candle to the bottom of that
+// pullback] — the second value is how long the counter-move lasted.
 f_pullback_depth(float ext_px, int since_bar, bool want_low) =>
     float depth = 0.0
+    int   bot_bars = 0
     n = math.min(bar_index - since_bar - 1, 495)
     if n >= 1
         for k = 1 to n
             d = want_low ? ext_px - low[k] : high[k] - ext_px
-            if d > depth
-                depth := d
-    depth
+            if d >= depth
+                depth    := d
+                bot_bars := bar_index - k - since_bar
+    [depth, bot_bars]
 
 // Is the swing at `level` (printed on level_bar) an ESTABLISHED structure: at
 // least ce_cont_bars candles old and separated from now by a pullback of at
@@ -1135,7 +1150,17 @@ f_pullback_depth(float ext_px, int since_bar, bool want_low) =>
 //     no real pullback yet) just makes the swing deeper/higher: the LEVEL is
 //     the deepest wick, a break still needs a close beyond it.
 f_swing_sig(float level, int level_bar, bool rising) =>
-    bar_index - level_bar >= ce_cont_bars and f_pullback_depth(level, level_bar, rising) >= ce_cont_atr * nz(atr_ce)
+    [pb_depth, pb_bars] = f_pullback_depth(level, level_bar, rising)
+    bar_index - level_bar >= ce_cont_bars and pb_depth >= ce_cont_atr * nz(atr_ce)
+
+// A continuation CE (a close beyond the last extreme after a pullback) is a
+// real structure change only if that extreme is an established swing AND the
+// counter-move was a real LEG: at least ce_leg_bars candles from the extreme
+// to the bottom of the pullback. One big candle against a trend is not a leg
+// — breaking its origin is just the trend making a new high/low.
+f_leg_real(float level, int level_bar, bool rising) =>
+    [lg_depth, lg_bars] = f_pullback_depth(level, level_bar, rising)
+    bar_index - level_bar >= ce_cont_bars and lg_depth >= ce_cont_atr * nz(atr_ce) and lg_bars >= ce_leg_bars
 
 // =============================================================
 // TIERED RISK ENGINE
@@ -1993,7 +2018,7 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
             // is an established swing; micro bounces inside a trend are not.
             old_ext     = trk_ext
             old_ext_bar = trk_ext_bar
-            old_sig     = f_swing_sig(old_ext, old_ext_bar, true)
+            old_sig     = f_leg_real(old_ext, old_ext_bar, true)
             trk_ext     := high
             trk_ext_bar := bar_index
             [tm1, tm1_bar, tm1_ok] = f_ce_ref(true, 0)
@@ -2023,7 +2048,7 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
         else if close < trk_ext
             old_ext_d     = trk_ext
             old_ext_bar_d = trk_ext_bar
-            old_sig_d     = f_swing_sig(old_ext_d, old_ext_bar_d, false)
+            old_sig_d     = f_leg_real(old_ext_d, old_ext_bar_d, false)
             trk_ext     := low
             trk_ext_bar := bar_index
             [tm2, tm2_bar, tm2_ok] = f_ce_ref(false, 0)
