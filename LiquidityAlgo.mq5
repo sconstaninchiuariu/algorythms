@@ -77,6 +77,7 @@ input ENUM_TIMEFRAMES EqlRefTF = PERIOD_M15;
 
 input group "=== Structure (CE) ==="
 input double CeLegPct      = 25.0; // CE: min pullback, % of the final leg that followed it
+input double CeDispAtr     = 0.75; // CE: a displacement candle (body >= this x ATR) that made the extreme may use its own wick
 input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
 input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
@@ -297,17 +298,21 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
    int got = CopyRates(_Symbol, PERIOD_M1, 0, eShift + CeScanBars + 1, r);
    if(got <= eShift + 3) return -1;
    double ext = isBear ? r[eShift].high : r[eShift].low;
-   // The search starts at the candle BEFORE the extreme: the extreme candle's
-   // own opposite wick is part of the reversal, never the start of the leg.
-   double m   = isBear ? r[eShift + 1].low  : r[eShift + 1].high;
-   datetime mt = r[eShift + 1].time;
+   // The search starts at the candle BEFORE the extreme (its own opposite wick
+   // is part of the reversal) - except a DISPLACEMENT candle in the push
+   // direction (body >= CeDispAtr x ATR): it is the move itself, so its own
+   // opposite wick is the start of the leg.
+   bool own = (isBear ? r[eShift].close > r[eShift].open : r[eShift].close < r[eShift].open)
+              && MathAbs(r[eShift].close - r[eShift].open) >= CeDispAtr * atrM1;
+   int  mIdx = own ? eShift : eShift + 1;
+   double m   = isBear ? r[mIdx].low : r[mIdx].high;
+   datetime mt = r[mIdx].time;
    // A swing needs a real reaction: at least one candle in the pullback must
    // close in its direction (bearish for the dip that forms a short's CE low,
-   // bullish for the bounce that forms a long's CE high). Wick-only "bounces"
-   // between candles of the same colour are not structure.
-   bool rev = isBear ? (r[eShift + 1].close < r[eShift + 1].open) : (r[eShift + 1].close > r[eShift + 1].open);
+   // bullish for the bounce that forms a long's CE high).
+   bool rev = own ? false : (isBear ? (r[mIdx].close < r[mIdx].open) : (r[mIdx].close > r[mIdx].open));
    int found = 0;
-   for(int i = eShift + 2; i < got; i++)
+   for(int i = mIdx + 1; i < got; i++)
      {
       rev = rev || (isBear ? (r[i].close < r[i].open) : (r[i].close > r[i].open));
       double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
