@@ -78,6 +78,8 @@ input ENUM_TIMEFRAMES EqlRefTF = PERIOD_M15;
 input group "=== Structure (CE) ==="
 input double CeLegPct      = 25.0; // CE: min pullback, % of the final leg that followed it
 input double CeDispAtr     = 0.75; // CE: a displacement candle (body >= this x ATR) that made the extreme may use its own wick
+input int    CeContBars    = 8;    // CE: a swing is "established" once this many candles old ...
+input double CeContAtr     = 2.0;  // ... and separated from now by a pullback of this many ATR (wick beyond it = retest, annulled)
 input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
 input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
@@ -120,7 +122,8 @@ bool     cycSessAsia = false, cycSessLondon = false, cycSessNy = false;
 double   sweepHi = 0, sweepLo = 0;           // wick extreme since the sweep (stop anchor)
 double   mssRefBear = 0, mssRefBull = 0;     // the CE level itself
 datetime mssRefBarTime = 0;                  // which M1 bar the CE level currently sits on
-double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from
+double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from (deepest wick of the swing)
+datetime ceExtHiT = 0, ceExtLoT = 0;         // candle that printed it
 double   atrM1 = 0; int atrCount = 0; double trSum = 0;  // Wilder ATR(14) on M1
 double   activeSweepPx = 0;
 
@@ -317,7 +320,14 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
       rev = rev || (isBear ? (r[i].close < r[i].open) : (r[i].close > r[i].open));
       double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
       double cm  = isBear ? r[i].high - m : m - r[i].low;
-      if(cm > 0 && cm >= thr && rev) { found = 1; break; }
+      if(cm > 0 && cm >= thr && rev)
+        {
+         found = 1;
+         // The candle that closes the pullback is part of the base: its own
+         // wick counts if it went deeper.
+         if(isBear ? r[i].low < m : r[i].high > m) { m = isBear ? r[i].low : r[i].high; mt = r[i].time; }
+         break;
+        }
       if(isBear ? r[i].low < m : r[i].high > m)
         {
          m = isBear ? r[i].low : r[i].high; mt = r[i].time;
@@ -326,6 +336,29 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
      }
    level = m; lvlTime = mt;
    return found;
+  }
+
+// Is the swing at `level` (printed on levelT) an established structure: at
+// least CeContBars candles old and separated from the processed bar (shift 1)
+// by a pullback of at least CeContAtr x ATR? rising: the level is a high.
+// Same definition as Pine's f_swing_sig.
+bool SwingSig(bool rising, double level, datetime levelT)
+  {
+   int sh = iBarShift(_Symbol, PERIOD_M1, levelT, false);
+   int span = sh - 1;
+   if(sh < 0 || span < CeContBars) return false;
+   int n = MathMin(span - 1, 495);
+   if(n < 1) return false;
+   MqlRates q[];
+   ArraySetAsSeries(q, true);
+   if(CopyRates(_Symbol, PERIOD_M1, 2, n, q) != n) return false;
+   double depth = 0;
+   for(int k = 0; k < n; k++)
+     {
+      double d = rising ? level - q[k].low : q[k].high - level;
+      if(d > depth) depth = d;
+     }
+   return depth >= CeContAtr * atrM1;
   }
 
 // Wilder ATR(14) of M1, updated once per processed bar (Pine ta.atr).
@@ -465,7 +498,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
          sweepHi = bar.h;
-         ceExtHi = bar.h;
+         ceExtHi = bar.h; ceExtHiT = bar.t;
          double lv = 0; datetime lt = bar.t;
          mssRefBear = (CeRef(true, 1, lv, lt) >= 0) ? lv : bar.l;
          mssRefBarTime = lt;
@@ -477,7 +510,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
          sweepLo = bar.l;
-         ceExtLo = bar.l;
+         ceExtLo = bar.l; ceExtLoT = bar.t;
          double lv = 0; datetime lt = bar.t;
          mssRefBull = (CeRef(false, 1, lv, lt) >= 0) ? lv : bar.h;
          mssRefBarTime = lt;
@@ -519,10 +552,12 @@ void ProcessNewM1Bar(const M1Bar &bar)
          // a wick beyond it that closes back inside is annulled.
          if(bar.c > ceExtHi)
            {
-            ceExtHi = bar.h;
+            ceExtHi = bar.h; ceExtHiT = bar.t;
             double lv = 0; datetime lt = 0;
             if(CeRef(true, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBear = lv; mssRefBarTime = lt; }
            }
+         else if(bar.h > ceExtHi && !SwingSig(true, ceExtHi, ceExtHiT))
+           { ceExtHi = bar.h; ceExtHiT = bar.t; }   // wick in a swing still forming: the level is the deepest wick
         }
      }
    else if(state == 2)
@@ -533,10 +568,12 @@ void ProcessNewM1Bar(const M1Bar &bar)
          if(bar.l < sweepLo) sweepLo = bar.l;
          if(bar.c < ceExtLo)
            {
-            ceExtLo = bar.l;
+            ceExtLo = bar.l; ceExtLoT = bar.t;
             double lv = 0; datetime lt = 0;
             if(CeRef(false, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBull = lv; mssRefBarTime = lt; }
            }
+         else if(bar.l < ceExtLo && !SwingSig(false, ceExtLo, ceExtLoT))
+           { ceExtLo = bar.l; ceExtLoT = bar.t; }
         }
      }
 

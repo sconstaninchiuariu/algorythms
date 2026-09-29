@@ -1096,6 +1096,12 @@ f_ce_ref(bool short_side, int e_off) =>
             cm  = short_side ? high[i] - m : m - low[i]
             if cm > 0 and cm >= thr and rev
                 found := true
+                // The candle that closes the pullback (e.g. the decline candle
+                // right before the base) is part of the base: its own wick
+                // counts if it went deeper.
+                if short_side ? low[i] < m : high[i] > m
+                    m   := short_side ? low[i] : high[i]
+                    m_i := i
                 break
             if short_side ? low[i] < m : high[i] > m
                 m   := short_side ? low[i] : high[i]
@@ -1105,6 +1111,31 @@ f_ce_ref(bool short_side, int e_off) =>
         res_bar := bar_index - m_i
     [res, res_bar, found]
 
+
+// Depth of the pullback between an extreme (bar since_bar) and now: how far
+// price fell from it (want_low) / rose from it, over the candles in between.
+// Bounded, and only evaluated on the rare events that need it.
+f_pullback_depth(float ext_px, int since_bar, bool want_low) =>
+    float depth = 0.0
+    n = math.min(bar_index - since_bar - 1, 495)
+    if n >= 1
+        for k = 1 to n
+            d = want_low ? ext_px - low[k] : high[k] - ext_px
+            if d > depth
+                depth := d
+    depth
+
+// Is the swing at `level` (printed on level_bar) an ESTABLISHED structure: at
+// least ce_cont_bars candles old and separated from now by a pullback of at
+// least ce_cont_atr x ATR? rising: the level is a high (pullback = drop).
+// Used for two things with one definition:
+//   - a wick beyond an established level is a RETEST (annulled: the level
+//     stays, only a CLOSE beyond it breaks it);
+//   - a wick beyond a level whose swing is still forming (adjacent candle,
+//     no real pullback yet) just makes the swing deeper/higher: the LEVEL is
+//     the deepest wick, a break still needs a close beyond it.
+f_swing_sig(float level, int level_bar, bool rising) =>
+    bar_index - level_bar >= ce_cont_bars and f_pullback_depth(level, level_bar, rising) >= ce_cont_atr * nz(atr_ce)
 
 // =============================================================
 // TIERED RISK ENGINE
@@ -1565,6 +1596,10 @@ if state == 1 and not bear_mss
         if ce_mv_b_ok and (na(mss_ref_bar) or ce_mv_b_bar > mss_ref_bar)
             mss_ref_bear := ce_mv_b
             mss_ref_bar  := ce_mv_b_bar
+    else if high > ce_ext_hi and not f_swing_sig(ce_ext_hi, ce_ext_hi_bar, true)
+        // Wick within a swing still forming: the level is the deepest wick.
+        ce_ext_hi     := high
+        ce_ext_hi_bar := bar_index
     if not na(mss_ref_line)
         // x1 must move too — a relocation moves the CE to a DIFFERENT candle,
         // not just a different price, so the line's start needs to follow.
@@ -1584,6 +1619,9 @@ if state == 2 and not bull_mss
         if ce_mv_u_ok and (na(mss_ref_bar) or ce_mv_u_bar > mss_ref_bar)
             mss_ref_bull := ce_mv_u
             mss_ref_bar  := ce_mv_u_bar
+    else if low < ce_ext_lo and not f_swing_sig(ce_ext_lo, ce_ext_lo_bar, false)
+        ce_ext_lo     := low
+        ce_ext_lo_bar := bar_index
     if not na(mss_ref_line)
         line.set_x1(mss_ref_line, mss_ref_bar)
         line.set_y1(mss_ref_line, mss_ref_bull)
@@ -1673,10 +1711,10 @@ if bull_mss
 // take the trade. Re-arming keeps it hunting until either a valid entry
 // appears or the whole cycle times out mss_max_bars after the sweep.
 rearm_ok = (bar_index - sweep_bar) <= mss_max_bars
-if state == 3 and bar_index > mss_bar and close > post_hi
+if state == 3 and bar_index > mss_bar and high > post_hi and (close > post_hi or not f_swing_sig(post_hi, post_hi_bar, true))
     post_hi     := high
     post_hi_bar := bar_index
-if state == 4 and bar_index > mss_bar and close < post_lo
+if state == 4 and bar_index > mss_bar and low < post_lo and (close < post_lo or not f_swing_sig(post_lo, post_lo_bar, false))
     post_lo     := low
     post_lo_bar := bar_index
 if use_fvg_entry and state == 3 and bar_index > mss_bar
@@ -1917,20 +1955,6 @@ var int   trk_ref_bar = na
 var line[]  ce_hist_lines  = array.new<line>(0)
 var label[] ce_hist_labels = array.new<label>(0)
 
-// Depth of the pullback between the broken extreme (bar since_bar) and now:
-// how far price fell from it (want_low) / rose from it, over the candles in
-// between. Bounded, and only evaluated on the rare "close beyond the last
-// extreme" events.
-f_pullback_depth(float ext_px, int since_bar, bool want_low) =>
-    float depth = 0.0
-    n = math.min(bar_index - since_bar - 1, 495)
-    if n >= 1
-        for k = 1 to n
-            d = want_low ? ext_px - low[k] : high[k] - ext_px
-            if d > depth
-                depth := d
-    depth
-
 f_ce_hist_draw(int x1, float y, bool bear_brk) =>
     col = bear_brk ? color.new(color.red, 15) : color.new(color.teal, 15)
     nl  = line.new(x1, y, bar_index, y, color = col, style = line.style_dotted, width = 1)
@@ -1963,21 +1987,28 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
             trk_ref     := tf1
             trk_ref_bar := tf1_bar
         else if close > trk_ext
-            // New high by CLOSE. If a real pullback separates it from the
-            // previous high, that high was structure and this candle broke
-            // it: continuation CE at the previous high — only if that high
-            // is a real swing (old enough, deep enough pullback); micro
-            // bounces inside a trend are not structure.
+            // New high by CLOSE: it broke the level (the deepest wick of the
+            // swing). If a real pullback separates them, that high was
+            // structure: continuation CE at the previous level — only if it
+            // is an established swing; micro bounces inside a trend are not.
             old_ext     = trk_ext
             old_ext_bar = trk_ext_bar
+            old_sig     = f_swing_sig(old_ext, old_ext_bar, true)
             trk_ext     := high
             trk_ext_bar := bar_index
             [tm1, tm1_bar, tm1_ok] = f_ce_ref(true, 0)
             if tm1_ok and (na(trk_ref_bar) or tm1_bar > trk_ref_bar)
                 trk_ref     := tm1
                 trk_ref_bar := tm1_bar
-                if in_any_sess and bar_index - old_ext_bar >= ce_cont_bars and f_pullback_depth(old_ext, old_ext_bar, true) >= ce_cont_atr * nz(atr_ce)
+                if in_any_sess and old_sig
                     f_ce_hist_draw(old_ext_bar, old_ext, false)
+        else if high > trk_ext and not f_swing_sig(trk_ext, trk_ext_bar, true)
+            // Wick beyond the level while that swing is still forming (the
+            // next candle's wick went a bit higher): the LEVEL is the highest
+            // wick. Not a break (no close beyond it). After a real pullback
+            // the same wick is a retest and is annulled (falls through).
+            trk_ext     := high
+            trk_ext_bar := bar_index
     else
         if not na(trk_ref) and bar_index > trk_ext_bar and close > trk_ref
             // Reversal (bullish CE); mirror.
@@ -1992,14 +2023,18 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
         else if close < trk_ext
             old_ext_d     = trk_ext
             old_ext_bar_d = trk_ext_bar
+            old_sig_d     = f_swing_sig(old_ext_d, old_ext_bar_d, false)
             trk_ext     := low
             trk_ext_bar := bar_index
             [tm2, tm2_bar, tm2_ok] = f_ce_ref(false, 0)
             if tm2_ok and (na(trk_ref_bar) or tm2_bar > trk_ref_bar)
                 trk_ref     := tm2
                 trk_ref_bar := tm2_bar
-                if in_any_sess and bar_index - old_ext_bar_d >= ce_cont_bars and f_pullback_depth(old_ext_d, old_ext_bar_d, false) >= ce_cont_atr * nz(atr_ce)
+                if in_any_sess and old_sig_d
                     f_ce_hist_draw(old_ext_bar_d, old_ext_d, true)
+        else if low < trk_ext and not f_swing_sig(trk_ext, trk_ext_bar, false)
+            trk_ext     := low
+            trk_ext_bar := bar_index
 
 // =============================================================
 // VISUALS — session range boxes (Asia/London/NY), instead of a flat
