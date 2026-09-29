@@ -1056,6 +1056,11 @@ atr_ce = ta.atr(14)
 // extreme candle's own opposite wick (e.g. the high of the hammer that made
 // the low) is part of the reversal, never the start of the leg — using it
 // produced one-candle CEs with no visible reason.
+// A swing also needs a REAL REACTION: the pullback only counts if at least
+// one candle in it closed in the pullback's direction (a bullish candle in
+// the bounce that forms a CE high, a bearish one in the dip that forms a CE
+// low). A "bounce" made only of the wicks of consecutive bearish candles is
+// not structure — it put a CE (and a long) in the middle of a straight drop.
 f_ce_ref(bool short_side, int e_off) =>
     float res     = na
     int   res_bar = na
@@ -1065,15 +1070,20 @@ f_ce_ref(bool short_side, int e_off) =>
         float ext = short_side ? high[e_off] : low[e_off]
         float m   = short_side ? low[e_off + 1] : high[e_off + 1]
         int   m_i = e_off + 1
+        // rev: a candle closing in the pullback's direction exists between
+        // the candle being tested and the running level (inclusive).
+        bool  rev = short_side ? close[e_off + 1] < open[e_off + 1] : close[e_off + 1] > open[e_off + 1]
         for i = e_off + 2 to e_off + lim
+            rev := rev or (short_side ? close[i] < open[i] : close[i] > open[i])
             thr = math.max(math.abs(ext - m) * ce_leg_pct / 100.0, ce_min_atr * nz(atr_ce))
             cm  = short_side ? high[i] - m : m - low[i]
-            if cm > 0 and cm >= thr
+            if cm > 0 and cm >= thr and rev
                 found := true
                 break
             if short_side ? low[i] < m : high[i] > m
                 m   := short_side ? low[i] : high[i]
                 m_i := i
+                rev := short_side ? close[i] < open[i] : close[i] > open[i]
         res     := m
         res_bar := bar_index - m_i
     [res, res_bar, found]
@@ -1583,7 +1593,11 @@ if bear_mss
         line.set_x2(mss_ref_line, bar_index)
         line.set_extend(mss_ref_line, extend.none)
     label.delete(ce_lbl)
-    ce_lbl := label.new(bar_index, high, "CE", style = label.style_label_down, color = color.orange, textcolor = color.black, size = size.tiny)
+    // With the CE history layer on, this candle already carries its "CE"
+    // mark and the yellow line: no second label.
+    ce_lbl := na
+    if not ce_hist
+        ce_lbl := label.new(bar_index, high, "CE", style = label.style_label_down, color = color.orange, textcolor = color.black, size = size.tiny)
 
 if bull_mss
     mss_bar      := bar_index
@@ -1596,7 +1610,9 @@ if bull_mss
         line.set_x2(mss_ref_line, bar_index)
         line.set_extend(mss_ref_line, extend.none)
     label.delete(ce_lbl)
-    ce_lbl := label.new(bar_index, low, "CE", style = label.style_label_up, color = color.orange, textcolor = color.black, size = size.tiny)
+    ce_lbl := na
+    if not ce_hist
+        ce_lbl := label.new(bar_index, low, "CE", style = label.style_label_up, color = color.orange, textcolor = color.black, size = size.tiny)
 
 // ROOT CAUSE #3 + "closest imbalance" rule. The old code checked
 // mss_bear_ok[1] — exactly one bar after the structure break — and gave up
@@ -1802,8 +1818,8 @@ if (touched_bear and close_ok_bear) or (touched_bull and close_ok_bull)
 // exactly the "marker but nothing in the Strategy Tester" the user saw.
 //
 // Now sl/tp/qty are computed unconditionally (na-safe) so a single validated
-// boolean (short_valid/long_valid) gates BOTH the plotted marker below and
-// the actual order here — they can never disagree. When the structural stop
+// boolean (short_valid/long_valid) gates the order and its alert — they can
+// never disagree. When the structural stop
 // is too wide it's CAPPED at max_sl instead of dropping the trade
 // (cap_sl_to_max, on by default); risk per trade stays bounded either way
 // since size is derived from the real stop distance.
@@ -2777,12 +2793,9 @@ plotshape(show_sweep and any_ls, title = "Sweep LOW",  style = shape.triangleup,
 // of a plotshape — only the current cycle's break stays visible, and only
 // while the bot is actively hunting for an entry, not a permanent history.
 
-// Entry signals
-// Gated by short_valid/long_valid (not the raw signal) so the marker can
-// never appear on a bar where the order was actually rejected by the SL/qty
-// checks — what you see on the chart is exactly what's in the Strategy Tester.
-plotshape(short_valid, title = "Short Entry", style = shape.arrowdown, location = location.abovebar, color = color.red,  size = size.tiny)
-plotshape(long_valid,  title = "Long Entry",  style = shape.arrowup,   location = location.belowbar, color = color.teal, size = size.tiny)
+// Entry markers: none from the script — TradingView already draws the order
+// arrow on the entry candle (its letter/quantity text is a chart setting:
+// Style > untick "Signal labels" and "Quantity").
 
 // Default mode: if the break happened inside session hours, short_valid/
 // long_valid already fired and reset state to 0 above — this only ever

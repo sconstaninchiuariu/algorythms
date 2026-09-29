@@ -301,13 +301,23 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
    // own opposite wick is part of the reversal, never the start of the leg.
    double m   = isBear ? r[eShift + 1].low  : r[eShift + 1].high;
    datetime mt = r[eShift + 1].time;
+   // A swing needs a real reaction: at least one candle in the pullback must
+   // close in its direction (bearish for the dip that forms a short's CE low,
+   // bullish for the bounce that forms a long's CE high). Wick-only "bounces"
+   // between candles of the same colour are not structure.
+   bool rev = isBear ? (r[eShift + 1].close < r[eShift + 1].open) : (r[eShift + 1].close > r[eShift + 1].open);
    int found = 0;
    for(int i = eShift + 2; i < got; i++)
      {
+      rev = rev || (isBear ? (r[i].close < r[i].open) : (r[i].close > r[i].open));
       double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
       double cm  = isBear ? r[i].high - m : m - r[i].low;
-      if(cm > 0 && cm >= thr) { found = 1; break; }
-      if(isBear ? r[i].low < m : r[i].high > m) { m = isBear ? r[i].low : r[i].high; mt = r[i].time; }
+      if(cm > 0 && cm >= thr && rev) { found = 1; break; }
+      if(isBear ? r[i].low < m : r[i].high > m)
+        {
+         m = isBear ? r[i].low : r[i].high; mt = r[i].time;
+         rev = isBear ? (r[i].close < r[i].open) : (r[i].close > r[i].open);
+        }
      }
    level = m; lvlTime = mt;
    return found;
