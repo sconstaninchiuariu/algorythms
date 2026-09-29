@@ -94,6 +94,8 @@ mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the 
 ce_leg_pct   = input.float(25.0, "CE: Min Pullback (% of final leg)", 5.0, 100.0, 5.0, group = GMSS, tooltip = "CE = the swing that STARTED the final leg into the liquidity (short: the low the last push up began from; long: the high the last push down began from). A pullback only counts as the start of a leg if it is at least this % of the leg that followed it, so small pauses inside one push are ignored.")
 ce_min_atr   = input.float(1.0,  "CE: Min Pullback (x ATR 14)", 0.0, 5.0, 0.1, group = GMSS, tooltip = "Absolute floor for the same pullback, in ATR(14) of the chart: stops 1-2 candle micro-dips from becoming the CE.")
 ce_scan_bars = input.int(60,     "CE: Lookback (candles)", 10, 300, group = GMSS, tooltip = "How far back from the extreme the start of the final leg is searched. If no qualifying pullback exists in this window (one straight impulse), the CE is the lowest low (short) / highest high (long) of the window.")
+ce_cont_bars = input.int(8,      "Continuation CE: min candles since the broken swing", 2, 100, group = GMSS, tooltip = "Audit layer only. A CE in the direction of the trend (a close beyond the last extreme after a pullback) is drawn only if that extreme is at least this many candles old ...")
+ce_cont_atr  = input.float(2.0,  "Continuation CE: min pullback (x ATR 14)", 0.5, 10.0, 0.1, group = GMSS, tooltip = "... and the pullback between it and the break was at least this many ATR. Micro-swings inside a trend (a 2-5 candle bounce) are not structure. Reversal CEs are not affected.")
 ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
@@ -220,6 +222,13 @@ imb_dist = max_poi_dist
 //    order. Plain request.security returns only the LAST one per chart bar,
 //    which is what used to build "1H gaps" on a 4H chart out of candles
 //    4 hours apart (real gaps missed, fake ones invented).
+// The strategy runs on the live bar only when it CLOSES (calc_on_every_tick is
+// off), so on load the last executed bar is the last CONFIRMED history bar,
+// where barstate.islast is false. Anything drawn "on the last bar" must use
+// this instead, or it would not appear until the current bar closes (a minute
+// on 1m, an hour/day on higher timeframes).
+render_bar = barstate.islast or barstate.islastconfirmedhistory
+
 chart_sec = timeframe.in_seconds(timeframe.period)
 hi_60  = chart_sec > 3600
 hi_240 = chart_sec > 14400
@@ -279,7 +288,7 @@ f_sess_key(int t) =>
 // last session all weekend, so Friday's swept lines never expired). Realtime
 // bars cap it at the bar's own close so Bar Replay still follows the replayed
 // clock. History bars draw nothing, their value is irrelevant.
-cur_sess_key = f_sess_key(barstate.isrealtime ? math.min(timenow, time_close - 1) : barstate.islast ? timenow : time)
+cur_sess_key = f_sess_key(barstate.isrealtime ? math.min(timenow, time_close - 1) : render_bar ? timenow : time)
 
 // Aggregates chart bars into candles of the period p = time(tf). Returns the
 // just-completed candle (open time, high, low) and the new period's start
@@ -473,7 +482,7 @@ f_htf_gap_nearest(array<float> near_arr, array<float> far_arr, array<int> org_ar
     float best_far = na
     int   best_org = na
     int   n = array.size(near_arr)
-    if n > 0 and barstate.islast
+    if n > 0 and render_bar
         int best_i = 0
         for i = 0 to n - 1
             e = array.get(near_arr, i)
@@ -986,7 +995,7 @@ f_eqh_nearest(array<float> px_arr, array<int> bar_arr) =>
     float best     = na
     int   best_bar = na
     n = array.size(px_arr)
-    if n > 0 and barstate.islast
+    if n > 0 and render_bar
         for i = 0 to n - 1
             e = array.get(px_arr, i)
             if na(best) or math.abs(close - e) < math.abs(close - best)
@@ -1900,6 +1909,20 @@ var int   trk_ref_bar = na
 var line[]  ce_hist_lines  = array.new<line>(0)
 var label[] ce_hist_labels = array.new<label>(0)
 
+// Depth of the pullback between the broken extreme (bar since_bar) and now:
+// how far price fell from it (want_low) / rose from it, over the candles in
+// between. Bounded, and only evaluated on the rare "close beyond the last
+// extreme" events.
+f_pullback_depth(float ext_px, int since_bar, bool want_low) =>
+    float depth = 0.0
+    n = math.min(bar_index - since_bar - 1, 495)
+    if n >= 1
+        for k = 1 to n
+            d = want_low ? ext_px - low[k] : high[k] - ext_px
+            if d > depth
+                depth := d
+    depth
+
 f_ce_hist_draw(int x1, float y, bool bear_brk) =>
     col = bear_brk ? color.new(color.red, 15) : color.new(color.teal, 15)
     nl  = line.new(x1, y, bar_index, y, color = col, style = line.style_dotted, width = 1)
@@ -1934,7 +1957,9 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
         else if close > trk_ext
             // New high by CLOSE. If a real pullback separates it from the
             // previous high, that high was structure and this candle broke
-            // it: continuation CE at the previous high.
+            // it: continuation CE at the previous high — only if that high
+            // is a real swing (old enough, deep enough pullback); micro
+            // bounces inside a trend are not structure.
             old_ext     = trk_ext
             old_ext_bar = trk_ext_bar
             trk_ext     := high
@@ -1943,7 +1968,7 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
             if tm1_ok and (na(trk_ref_bar) or tm1_bar > trk_ref_bar)
                 trk_ref     := tm1
                 trk_ref_bar := tm1_bar
-                if in_any_sess
+                if in_any_sess and bar_index - old_ext_bar >= ce_cont_bars and f_pullback_depth(old_ext, old_ext_bar, true) >= ce_cont_atr * nz(atr_ce)
                     f_ce_hist_draw(old_ext_bar, old_ext, false)
     else
         if not na(trk_ref) and bar_index > trk_ext_bar and close > trk_ref
@@ -1965,7 +1990,7 @@ if ce_hist and is_exec_tf and bar_index > ce_scan_bars
             if tm2_ok and (na(trk_ref_bar) or tm2_bar > trk_ref_bar)
                 trk_ref     := tm2
                 trk_ref_bar := tm2_bar
-                if in_any_sess
+                if in_any_sess and bar_index - old_ext_bar_d >= ce_cont_bars and f_pullback_depth(old_ext_d, old_ext_bar_d, false) >= ce_cont_atr * nz(atr_ce)
                     f_ce_hist_draw(old_ext_bar_d, old_ext_d, true)
 
 // =============================================================
@@ -2240,7 +2265,7 @@ if fire_um
 // the last bar). Building them on every historical bar was the single
 // biggest cost of the script: the whole merge/sort/draw pass thousands of
 // times for drawings that were deleted on the very next bar.
-if barstate.islast
+if render_bar
     n_ml = array.size(managed_poi_lines)
     if n_ml > 0
         for i = 0 to n_ml - 1
@@ -2284,7 +2309,7 @@ imb_line_faded = color.new(imb_line_col, imb_line_transp)
 imb_text_solid = color.new(imb_line_col, 0)
 active_col      = color.new(color.lime, 10)
 
-if show_levels and barstate.islast
+if show_levels and render_bar
     poi_px  = array.new_float(0)
     poi_nm  = array.new_string(0)
     poi_cl  = array.new<color>(0)   // line color
@@ -2817,7 +2842,7 @@ if not use_fvg_entry and (state == 3 or state == 4) and (bar_index - sweep_bar) 
 
 var table tbl = table.new(position.top_right, 2, 15, bgcolor = color.new(color.black, 75), border_width = 1, border_color = color.gray)
 
-if barstate.islast and show_info_tbl
+if render_bar and show_info_tbl
     table.cell(tbl, 0, 0, "Liquidity Algo", text_color = color.white, bgcolor = color.new(color.navy, 50), text_size = size.normal)
     table.cell(tbl, 1, 0, "",               text_color = color.white, bgcolor = color.new(color.navy, 50), text_size = size.normal)
 
@@ -2914,7 +2939,7 @@ if barstate.islast and show_info_tbl
 
 var table stats = table.new(position.top_left, 2, 9, bgcolor = color.new(color.black, 75), border_width = 1, border_color = color.gray)
 
-if barstate.islast and show_stats_tbl
+if render_bar and show_stats_tbl
     n_closed = strategy.closedtrades
     n_wins   = strategy.wintrades
     n_loss   = strategy.losstrades
@@ -2970,7 +2995,7 @@ f_chk_cell(bool done, bool applicable) =>
     col = not applicable ? color.gray : done ? color.lime : color.orange
     [txt, col]
 
-if barstate.islast and show_checklist and state != 0
+if render_bar and show_checklist and state != 0
     dir_str = (state == 1 or state == 3) ? "BAJISTA" : "ALCISTA"
     dir_col = (state == 1 or state == 3) ? color.red : color.teal
     table.cell(checklist, 0, 0, "SETUP " + dir_str, text_color = color.white, bgcolor = color.new(dir_col, 30), text_size = size.normal)
