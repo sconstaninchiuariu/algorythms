@@ -81,6 +81,7 @@ input double CeDispAtr     = 0.75; // CE: a displacement candle (body >= this x 
 input int    CeContBars    = 8;    // CE: a swing is "established" once this many candles old ...
 input double CeContAtr     = 2.0;  // ... and separated from now by a pullback of this many ATR (wick beyond it = retest, annulled)
 input double CeLegCapAtr   = 1.25; // CE: the %-of-leg part of the pullback threshold never exceeds this many ATR
+input int    CePivBars     = 5;    // CE: displacement candle -> last swing within this many candles before it is the base
 input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
 input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
@@ -308,6 +309,23 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
    // opposite wick is the start of the leg.
    bool own = (isBear ? r[eShift].close > r[eShift].open : r[eShift].close < r[eShift].open)
               && MathAbs(r[eShift].close - r[eShift].open) >= CeDispAtr * atrM1;
+   // Displacement candle: its base is the last swing (3-candle fractal) right
+   // before it, even when that pause is smaller than a normal pullback.
+   if(own)
+     {
+      int pivEnd = MathMin(eShift + CePivBars, got - 2);
+      for(int jx = eShift + 1; jx <= pivEnd; jx++)
+        {
+         bool piv = isBear ? (r[jx].low < r[jx + 1].low && r[jx].low < r[jx - 1].low)
+                           : (r[jx].high > r[jx + 1].high && r[jx].high > r[jx - 1].high);
+         if(piv)
+           {
+            level = isBear ? r[jx].low : r[jx].high;
+            lvlTime = r[jx].time;
+            return 1;
+           }
+        }
+     }
    int  mIdx = own ? eShift : eShift + 1;
    double m   = isBear ? r[mIdx].low : r[mIdx].high;
    datetime mt = r[mIdx].time;

@@ -99,6 +99,7 @@ ce_cont_bars = input.int(8,      "Continuation CE: min candles since the broken 
 ce_cont_atr  = input.float(2.0,  "Continuation CE: min pullback (x ATR 14)", 0.5, 10.0, 0.1, group = GMSS, tooltip = "... and the pullback between it and the break was at least this many ATR. Micro-swings inside a trend (a 2-5 candle bounce) are not structure. Reversal CEs are not affected.")
 ce_disp_atr  = input.float(0.75, "CE: Displacement candle (min body x ATR 14)", 0.1, 3.0, 0.05, group = GMSS, tooltip = "When the candle that made the extreme is itself a strong candle in the push direction (a big green candle that dips and closes above the previous high, for a short setup), its own low IS the start of the move and can be the CE (e.g. a green candle that went a little deeper than the red one before it). Ordinary small candles never count: their own wick is part of the reversal, not the start of the leg.")
 ce_leg_bars  = input.int(3,      "Continuation CE: min candles of the counter-move", 1, 30, group = GMSS, tooltip = "Audit layer only. A counter-move only counts as a leg (whose origin, when broken, is a CE) if at least this many candles separate the extreme from the bottom of the pullback. One big candle against a trend is not a leg: breaking its origin is just the trend making a new high/low, not a change of structure.")
+ce_piv_bars  = input.int(5,      "CE: Displacement base lookback (candles)", 1, 20, group = GMSS, tooltip = "When the extreme was made by a displacement candle (see above), the CE is the last swing (3-candle low for a short setup / high for a long one) within this many candles before it: the base the impulse started from, even if that pause is smaller than a normal pullback. Without a swing in that window the usual pullback scan is used.")
 ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
@@ -151,6 +152,9 @@ show_sweep   = input.bool(true, "Sweep Marks", group = GVIS, inline = "show2")
 show_checklist = input.bool(true, "Setup Checklist", group = GVIS, inline = "show2")
 show_info_tbl  = input.bool(false, "Info Table",  group = GVIS, inline = "show3")
 show_stats_tbl = input.bool(false, "Stats Table", group = GVIS, inline = "show3")
+show_vol_cell  = input.bool(true, "Volatility row in the setup panel", group = GVIS, inline = "show4")
+vol_symbol_override = input.string("", "Volatility symbol (blank = auto)", group = GVIS,
+     tooltip = "Blank: EUR pairs -> CBOE:EVZ (euro currency volatility), QQQ/NQ -> CBOE:VXN, SPY/ES -> CBOE:VIX, DIA/YM -> CBOE:VXD, IWM/RTY -> CBOE:RVX, gold -> CBOE:GVZ, oil -> CBOE:OVX. Any other symbol (or a ticker TradingView does not have) shows the symbol's own daily ATR(14) as % of price. Type any ticker here to override, e.g. CBOE:VXN.")
 
 poi_line_col    = input.color(color.white, "POI Line Color", group = GVIS,
      tooltip = "One flat color for every POI line (PDH/PDL, PWH/PWL, Asia, EQH/EQL) — always solid, straight. The active swept level still turns green while its trade cycle is live.")
@@ -183,6 +187,27 @@ use_sweep_alert      = input.bool(true, "Alert the instant a POI zone is liquida
 vis_adr      = request.security(syminfo.tickerid, "D", ta.sma(high - low, vis_adr_len)[1], lookahead = barmerge.lookahead_on)
 vis_pct_eff  = syminfo.type == "futures" ? vis_dist_pct * 2.0 : vis_dist_pct
 max_poi_dist = vis_mode == "Auto (ADR)" and not na(vis_adr) ? vis_adr * vis_adr_pct / 100.0 : close * vis_pct_eff / 100.0
+
+
+// ---- Volatility reading for the setup panel ----------------------------
+// Implied-volatility index matching the open symbol (blank override = auto),
+// or, when TradingView has none for it, the symbol's own daily ATR(14) as %
+// of price (previous closed day, identical on every chart timeframe).
+vol_root = str.upper(syminfo.root)
+vol_list_eur = ",6E,EUR,FXE,EUR1,"
+vol_list_nq  = ",QQQ,NQ,NDX,US100,NAS100,USTEC,MNQ,QQQM,"
+vol_list_spx = ",SPY,ES,SPX,US500,SPX500,MES,VOO,IVV,"
+vol_list_dow = ",DIA,YM,DJI,US30,MYM,"
+vol_list_rut = ",IWM,RTY,RUT,M2K,US2000,"
+vol_list_gld = ",GLD,GC,XAUUSD,MGC,IAU,"
+vol_list_oil = ",USO,CL,USOIL,WTI,MCL,"
+vol_key = "," + vol_root + ","
+vol_auto_sym = syminfo.type == "forex" and (syminfo.basecurrency == "EUR" or syminfo.currency == "EUR") ? "CBOE:EVZ" : str.contains(vol_list_eur, vol_key) ? "CBOE:EVZ" : str.contains(vol_list_nq, vol_key) ? "CBOE:VXN" : str.contains(vol_list_spx, vol_key) ? "CBOE:VIX" : str.contains(vol_list_dow, vol_key) ? "CBOE:VXD" : str.contains(vol_list_rut, vol_key) ? "CBOE:RVX" : str.contains(vol_list_gld, vol_key) ? "CBOE:GVZ" : str.contains(vol_list_oil, vol_key) ? "CBOE:OVX" : ""
+vol_sym  = vol_symbol_override != "" ? vol_symbol_override : vol_auto_sym
+vol_name = str.contains(vol_sym, ":") ? str.substring(vol_sym, str.pos(vol_sym, ":") + 1) : vol_sym
+vol_idx  = vol_sym != "" and show_vol_cell ? request.security(vol_sym, "D", close, ignore_invalid_symbol = true) : na
+vol_atr_pct = show_vol_cell ? request.security(syminfo.tickerid, "D", (ta.atr(14) / close * 100.0)[1], lookahead = barmerge.lookahead_on) : na
+vol_txt = not show_vol_cell ? "" : not na(vol_idx) ? vol_name + " " + str.tostring(vol_idx, "#.0") + "% (±" + str.tostring(vol_idx / 15.8745, "#.00") + "%/d)" : not na(vol_atr_pct) ? "ATR-D " + str.tostring(vol_atr_pct, "#.00") + "%" : "N/D"
 
 near_pct_eff       = syminfo.type == "futures" ? near_alert_pct * 2.0 : near_alert_pct
 near_dist          = close * near_pct_eff / 100.0
@@ -1096,35 +1121,48 @@ f_ce_ref(bool short_side, int e_off) =>
     if e_off >= 0 and lim >= 3
         float ext = short_side ? high[e_off] : low[e_off]
         bool  own = (short_side ? close[e_off] > open[e_off] : close[e_off] < open[e_off]) and math.abs(close[e_off] - open[e_off]) >= ce_disp_atr * nz(atr_ce)
-        int   m_i = own ? e_off : e_off + 1
-        float m   = short_side ? low[m_i] : high[m_i]
-        // rev: a candle closing in the pullback's direction exists between
-        // the candle being tested and the running level (inclusive). A push
-        // candle used as the start is not a pullback candle.
-        bool  rev = own ? false : (short_side ? close[m_i] < open[m_i] : close[m_i] > open[m_i])
-        for i = m_i + 1 to e_off + lim
-            rev := rev or (short_side ? close[i] < open[i] : close[i] > open[i])
-            // The %-of-leg part is capped in ATR: the leg keeps growing while
-            // the scan walks back, so on a long rally with shallow pullbacks
-            // 25% of it exceeded every real pullback and the CE jumped to the
-            // origin of the whole move (the trade CE drawn far below price).
-            thr = math.max(ce_min_atr * nz(atr_ce), math.min(math.abs(ext - m) * ce_leg_pct / 100.0, ce_leg_cap_atr * nz(atr_ce)))
-            cm  = short_side ? high[i] - m : m - low[i]
-            if cm > 0 and cm >= thr and rev
-                found := true
-                // The candle that closes the pullback (e.g. the decline candle
-                // right before the base) is part of the base: its own wick
-                // counts if it went deeper.
+        // Displacement candle: its base is the last swing right before it,
+        // even when that pause is smaller than a normal pullback (a giant
+        // vertical candle preceded by a 1-2 candle pause: the pause IS the
+        // origin of the impulse, the depth scan below would skip it).
+        if own
+            for j = e_off + 1 to e_off + math.min(ce_piv_bars, lim - 1)
+                bool piv = short_side ? (low[j] < low[j + 1] and low[j] < low[j - 1]) : (high[j] > high[j + 1] and high[j] > high[j - 1])
+                if piv
+                    found   := true
+                    res     := short_side ? low[j] : high[j]
+                    res_bar := bar_index - j
+                    break
+        if not found
+            int   m_i = own ? e_off : e_off + 1
+            float m   = short_side ? low[m_i] : high[m_i]
+            // rev: a candle closing in the pullback's direction exists between
+            // the candle being tested and the running level (inclusive). A push
+            // candle used as the start is not a pullback candle.
+            bool  rev = own ? false : (short_side ? close[m_i] < open[m_i] : close[m_i] > open[m_i])
+            for i = m_i + 1 to e_off + lim
+                rev := rev or (short_side ? close[i] < open[i] : close[i] > open[i])
+                // The %-of-leg part is capped in ATR: the leg keeps growing while
+                // the scan walks back, so on a long rally with shallow pullbacks
+                // 25% of it exceeded every real pullback and the CE jumped to the
+                // origin of the whole move (the trade CE drawn far below price).
+                thr = math.max(ce_min_atr * nz(atr_ce), math.min(math.abs(ext - m) * ce_leg_pct / 100.0, ce_leg_cap_atr * nz(atr_ce)))
+                cm  = short_side ? high[i] - m : m - low[i]
+                if cm > 0 and cm >= thr and rev
+                    found := true
+                    // The candle that closes the pullback (e.g. the decline candle
+                    // right before the base) is part of the base: its own wick
+                    // counts if it went deeper.
+                    if short_side ? low[i] < m : high[i] > m
+                        m   := short_side ? low[i] : high[i]
+                        m_i := i
+                    break
                 if short_side ? low[i] < m : high[i] > m
                     m   := short_side ? low[i] : high[i]
                     m_i := i
-                break
-            if short_side ? low[i] < m : high[i] > m
-                m   := short_side ? low[i] : high[i]
-                m_i := i
-                rev := short_side ? close[i] < open[i] : close[i] > open[i]
-        res     := m
-        res_bar := bar_index - m_i
+                    rev := short_side ? close[i] < open[i] : close[i] > open[i]
+            res     := m
+            res_bar := bar_index - m_i
     [res, res_bar, found]
 
 
@@ -3061,7 +3099,7 @@ if render_bar and show_stats_tbl
 // yet" is visible on the chart instead of a guessing game.
 // =============================================================
 
-var table checklist = table.new(position.bottom_right, 2, 6, bgcolor = color.new(color.black, 75), border_width = 1, border_color = color.gray)
+var table checklist = table.new(position.bottom_right, 2, 7, bgcolor = color.new(color.black, 75), border_width = 1, border_color = color.gray)
 
 f_chk_cell(bool done, bool applicable) =>
     txt = not applicable ? "N/D" : done ? "✓" : "⏳"
@@ -3107,6 +3145,12 @@ if render_bar and show_checklist and state != 0
         [c4txt, c4col] = f_chk_cell(can_trade_entry, state == 3 or state == 4)
         table.cell(checklist, 0, 4, "Sesión Abierta",      text_color = color.gray, text_size = size.small)
         table.cell(checklist, 1, 4, c4txt, text_color = c4col, text_size = size.small)
+
+    // Volatility of the open symbol (index or own daily ATR %), last row.
+    if show_vol_cell
+        vol_row = use_fvg_entry ? 6 : 5
+        table.cell(checklist, 0, vol_row, "Volatilidad", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, vol_row, vol_txt,       text_color = color.white, text_size = size.small)
 
 // =============================================================
 // ALERTS
