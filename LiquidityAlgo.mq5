@@ -80,6 +80,7 @@ input double CeLegPct      = 25.0; // CE: min pullback, % of the final leg that 
 input double CeDispAtr     = 0.75; // CE: a displacement candle (body >= this x ATR) that made the extreme may use its own wick
 input int    CeContBars    = 8;    // CE: a swing is "established" once this many candles old ...
 input double CeContAtr     = 2.0;  // ... and separated from now by a pullback of this many ATR (wick beyond it = retest, annulled)
+input double CeLegCapAtr   = 1.25; // CE: the %-of-leg part of the pullback threshold never exceeds this many ATR
 input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
 input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
@@ -318,7 +319,7 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
    for(int i = mIdx + 1; i < got; i++)
      {
       rev = rev || (isBear ? (r[i].close < r[i].open) : (r[i].close > r[i].open));
-      double thr = MathMax(MathAbs(ext - m) * CeLegPct / 100.0, CeMinAtr * atrM1);
+      double thr = MathMax(CeMinAtr * atrM1, MathMin(MathAbs(ext - m) * CeLegPct / 100.0, CeLegCapAtr * atrM1));
       double cm  = isBear ? r[i].high - m : m - r[i].low;
       if(cm > 0 && cm >= thr && rev)
         {

@@ -93,6 +93,7 @@ var string GMSS = "MSS Settings"
 mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the sweep)", 5, 500, group = GMSS, tooltip = "How long the bot keeps hunting for the structure break after a zone is liquidated. Price often sweeps a level and then keeps running for another 50-80 bars before the actual reaction, so a short deadline kills the setup right before the trade it was waiting for. A cycle is also abandoned immediately if the session it armed in ends first (Asia/London/NY) — it never waits across a session boundary — so this deadline mainly matters for setups that time out within the same session.")
 ce_leg_pct   = input.float(25.0, "CE: Min Pullback (% of final leg)", 5.0, 100.0, 5.0, group = GMSS, tooltip = "CE = the swing that STARTED the final leg into the liquidity (short: the low the last push up began from; long: the high the last push down began from). A pullback only counts as the start of a leg if it is at least this % of the leg that followed it, so small pauses inside one push are ignored.")
 ce_min_atr   = input.float(1.0,  "CE: Min Pullback (x ATR 14)", 0.0, 5.0, 0.1, group = GMSS, tooltip = "Absolute floor for the same pullback, in ATR(14) of the chart: stops 1-2 candle micro-dips from becoming the CE.")
+ce_leg_cap_atr = input.float(1.25, "CE: Cap of the %-of-leg pullback term (x ATR 14)", 0.5, 5.0, 0.05, group = GMSS, tooltip = "The '% of final leg' part of the pullback threshold can never exceed this many ATR. Without a cap, on a long rally with shallow pullbacks the CE jumps to the origin of the whole move, far from price.")
 ce_scan_bars = input.int(60,     "CE: Lookback (candles)", 10, 300, group = GMSS, tooltip = "How far back from the extreme the start of the final leg is searched. If no qualifying pullback exists in this window (one straight impulse), the CE is the lowest low (short) / highest high (long) of the window.")
 ce_cont_bars = input.int(8,      "Continuation CE: min candles since the broken swing", 2, 100, group = GMSS, tooltip = "Audit layer only. A CE in the direction of the trend (a close beyond the last extreme after a pullback) is drawn only if that extreme is at least this many candles old ...")
 ce_cont_atr  = input.float(2.0,  "Continuation CE: min pullback (x ATR 14)", 0.5, 10.0, 0.1, group = GMSS, tooltip = "... and the pullback between it and the break was at least this many ATR. Micro-swings inside a trend (a 2-5 candle bounce) are not structure. Reversal CEs are not affected.")
@@ -1103,7 +1104,11 @@ f_ce_ref(bool short_side, int e_off) =>
         bool  rev = own ? false : (short_side ? close[m_i] < open[m_i] : close[m_i] > open[m_i])
         for i = m_i + 1 to e_off + lim
             rev := rev or (short_side ? close[i] < open[i] : close[i] > open[i])
-            thr = math.max(math.abs(ext - m) * ce_leg_pct / 100.0, ce_min_atr * nz(atr_ce))
+            // The %-of-leg part is capped in ATR: the leg keeps growing while
+            // the scan walks back, so on a long rally with shallow pullbacks
+            // 25% of it exceeded every real pullback and the CE jumped to the
+            // origin of the whole move (the trade CE drawn far below price).
+            thr = math.max(ce_min_atr * nz(atr_ce), math.min(math.abs(ext - m) * ce_leg_pct / 100.0, ce_leg_cap_atr * nz(atr_ce)))
             cm  = short_side ? high[i] - m : m - low[i]
             if cm > 0 and cm >= thr and rev
                 found := true
