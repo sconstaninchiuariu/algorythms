@@ -82,6 +82,7 @@ input int    CeContBars    = 8;    // CE: a swing is "established" once this man
 input double CeContAtr     = 2.0;  // ... and separated from now by a pullback of this many ATR (wick beyond it = retest, annulled)
 input double CeLegCapAtr   = 1.25; // CE: the %-of-leg part of the pullback threshold never exceeds this many ATR
 input int    CePivBars     = 5;    // CE: displacement candle -> last swing within this many candles before it is the base
+input int    CeRunBars     = 3;    // CE: displacement candle ending a run of >= this many same-direction candles -> origin of the run
 input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
 input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
 input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
@@ -324,6 +325,22 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
             lvlTime = r[jx].time;
             return 1;
            }
+        }
+     }
+   // No single-candle swing: the extreme ends a run of consecutive push-
+   // direction candles (an impulse); its origin is the pause candle before the
+   // run, or the first candle of the run if its wick went deeper.
+   if(own)
+     {
+      int kx = eShift + 1;
+      while(kx < got - 1 && (isBear ? r[kx].close > r[kx].open : r[kx].close < r[kx].open)) kx++;
+      if(kx - eShift >= CeRunBars && kx < got - 1)
+        {
+         int kk = kx;
+         if(isBear ? r[kx - 1].low < r[kx].low : r[kx - 1].high > r[kx].high) kk = kx - 1;
+         level = isBear ? r[kk].low : r[kk].high;
+         lvlTime = r[kk].time;
+         return 1;
         }
      }
    int  mIdx = own ? eShift : eShift + 1;

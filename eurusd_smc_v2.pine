@@ -100,6 +100,7 @@ ce_cont_atr  = input.float(2.0,  "Continuation CE: min pullback (x ATR 14)", 0.5
 ce_disp_atr  = input.float(0.75, "CE: Displacement candle (min body x ATR 14)", 0.1, 3.0, 0.05, group = GMSS, tooltip = "When the candle that made the extreme is itself a strong candle in the push direction (a big green candle that dips and closes above the previous high, for a short setup), its own low IS the start of the move and can be the CE (e.g. a green candle that went a little deeper than the red one before it). Ordinary small candles never count: their own wick is part of the reversal, not the start of the leg.")
 ce_leg_bars  = input.int(3,      "Continuation CE: min candles of the counter-move", 1, 30, group = GMSS, tooltip = "Audit layer only. A counter-move only counts as a leg (whose origin, when broken, is a CE) if at least this many candles separate the extreme from the bottom of the pullback. One big candle against a trend is not a leg: breaking its origin is just the trend making a new high/low, not a change of structure.")
 ce_piv_bars  = input.int(5,      "CE: Displacement base lookback (candles)", 1, 20, group = GMSS, tooltip = "When the extreme was made by a displacement candle (see above), the CE is the last swing (3-candle low for a short setup / high for a long one) within this many candles before it: the base the impulse started from, even if that pause is smaller than a normal pullback. Without a swing in that window the usual pullback scan is used.")
+ce_run_bars  = input.int(3,      "CE: Displacement impulse run (min candles)", 2, 10, group = GMSS, tooltip = "When a displacement candle ends a run of at least this many consecutive candles in the same direction (an impulse), the CE is the origin of that run: the deeper wick of the pause candle before it and the first candle of the run, even when that pause is smaller than a normal pullback.")
 ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
 
@@ -1133,6 +1134,22 @@ f_ce_ref(bool short_side, int e_off) =>
                     res     := short_side ? low[j] : high[j]
                     res_bar := bar_index - j
                     break
+            // No single-candle swing: the extreme ends a run of consecutive
+            // push-direction candles (an impulse). Its origin is the pause
+            // candle right before the run (or the first candle of the run if
+            // its wick went deeper) — e.g. the one small bounce before a
+            // 4-candle drop, which the pullback-depth scan would skip.
+            if not found
+                int k = e_off + 1
+                while k < e_off + lim and (short_side ? close[k] > open[k] : close[k] < open[k])
+                    k += 1
+                if k - e_off >= ce_run_bars and k < e_off + lim
+                    int kk = k
+                    if short_side ? low[k - 1] < low[k] : high[k - 1] > high[k]
+                        kk := k - 1
+                    found   := true
+                    res     := short_side ? low[kk] : high[kk]
+                    res_bar := bar_index - kk
         if not found
             int   m_i = own ? e_off : e_off + 1
             float m   = short_side ? low[m_i] : high[m_i]
