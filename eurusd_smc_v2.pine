@@ -38,6 +38,11 @@ strategy(
     // exposure — our own risk-per-trade sizing is already the real risk
     // control, TradingView's cash-margin model was never the right model
     // for this instrument.
+    // Ticks recalculate the script on the live bar so every chart timeframe
+    // draws its zones from the CURRENT price and clock (otherwise a D chart
+    // would show yesterday's state). Orders are still placed only once, on
+    // the bar's close (order_bar), exactly as before.
+    calc_on_every_tick = true,
     margin_long       = 0,
     margin_short      = 0,
     max_bars_back     = 500,
@@ -176,6 +181,15 @@ merge_tol   = input.float(0.0005, "Zone Merge Tolerance", 0.00010, 0.005, 0.0001
 lbl_off_bars = input.int(3, "Labels: candles right of the last candle", 0, 30, group = GVIS,
      tooltip = "Labels of live lines sit this many candles to the right of the last candle, in the chart's right margin, instead of on top of price. Names are just the source: 1H / 4H / D / W / MN for imbalances, PDH / PDL / PWH / PWL / EQH / EQL for levels.")
 
+age_1h_d = input.int(14, "Max age 1H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS,
+     tooltip = "Older untouched zones are not drawn, identically on every timeframe. D / W / MN imbalances have no limit.")
+age_4h_d = input.int(45, "Max age 4H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS)
+age_eq_d = input.int(14, "Max age EQH / EQL (days, 0 = no limit)", 0, 3650, group = GVIS)
+
+// Zone origin (open time of its candle) still young enough to draw.
+f_age_ok(int org, int days) =>
+    days == 0 or na(org) or time - org <= days * 86400000
+
 var string GALR = "Proximity Alerts"
 use_near_alert       = input.bool(true, "Alert when price nears a POI zone", group = GALR)
 near_alert_pct       = input.float(0.20, "Create Alert at Distance (% of price) — forex baseline; auto x2 on futures", 0.02, 2.0, 0.01, group = GALR)
@@ -257,6 +271,8 @@ imb_dist = max_poi_dist
 // this instead, or it would not appear until the current bar closes (a minute
 // on 1m, an hour/day on higher timeframes).
 render_bar = barstate.islast or barstate.islastconfirmedhistory
+// Orders only at the bar's close (historical bars are always "confirmed").
+order_bar  = barstate.isconfirmed or not barstate.isrealtime
 
 chart_sec = timeframe.in_seconds(timeframe.period)
 hi_60  = chart_sec > 3600
@@ -1977,7 +1993,7 @@ tp_price_l  = close + (close - sl_price_l) * rr_ratio
 qty_l       = f_qty(sl_dist_l)
 long_valid  = long_signal and sl_dist_l >= min_sl and sl_dist_l <= max_sl and qty_l > 0
 
-if short_valid
+if short_valid and order_bar
     strategy.entry("Short", strategy.short, qty = qty_s, comment = "S")
     strategy.exit("SX", from_entry = "Short", stop = sl_price_s, limit = tp_price_s, comment_profit = "TP", comment_loss = "SL")
     trades_today += 1
@@ -1996,7 +2012,7 @@ if short_valid
     fvg_bot_line := tmp_fvg_l2
     fvg_lbl := tmp_fvg_lb
 
-if long_valid
+if long_valid and order_bar
     strategy.entry("Long", strategy.long, qty = qty_l, comment = "L")
     strategy.exit("LX", from_entry = "Long", stop = sl_price_l, limit = tp_price_l, comment_profit = "TP", comment_loss = "SL")
     trades_today += 1
@@ -2502,7 +2518,7 @@ if show_levels and render_bar
         if n_eqh > 0
             for i = 0 to n_eqh - 1
                 px = array.get(eqh_arr, i)
-                if poi_in_rng(px)
+                if poi_in_rng(px) and f_age_ok(array.get(eqh_bar_arr, i), age_eq_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "EQH")
                     array.push(poi_cl, poi_line_solid)
@@ -2516,7 +2532,7 @@ if show_levels and render_bar
         if n_eql > 0
             for i = 0 to n_eql - 1
                 px = array.get(eql_arr, i)
-                if poi_in_rng(px)
+                if poi_in_rng(px) and f_age_ok(array.get(eql_bar_arr, i), age_eq_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "EQL")
                     array.push(poi_cl, poi_line_solid)
@@ -2561,7 +2577,7 @@ if show_levels and render_bar
             b1h_outer = f_recompute_outer(htf_b1h_near_arr, htf_b1h_far_arr, htf_b1h_org_arr, true, 3 * 3600000)
             for i = 0 to n_b1h - 1
                 px = array.get(htf_b1h_near_arr, i)
-                if f_imb_in_rng(px) and array.get(b1h_outer, i)
+                if f_imb_in_rng(px) and array.get(b1h_outer, i) and f_age_ok(array.get(htf_b1h_org_arr, i), age_1h_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "1H")
                     array.push(poi_cl, imb_line_faded)
@@ -2576,7 +2592,7 @@ if show_levels and render_bar
             u1h_outer = f_recompute_outer(htf_u1h_near_arr, htf_u1h_far_arr, htf_u1h_org_arr, false, 3 * 3600000)
             for i = 0 to n_u1h - 1
                 px = array.get(htf_u1h_near_arr, i)
-                if f_imb_in_rng(px) and array.get(u1h_outer, i)
+                if f_imb_in_rng(px) and array.get(u1h_outer, i) and f_age_ok(array.get(htf_u1h_org_arr, i), age_1h_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "1H")
                     array.push(poi_cl, imb_line_faded)
@@ -2617,7 +2633,7 @@ if show_levels and render_bar
             b4h_outer = f_recompute_outer(htf_b4h_near_arr, htf_b4h_far_arr, htf_b4h_org_arr, true, 3 * 14400000)
             for i = 0 to n_b4h - 1
                 px = array.get(htf_b4h_near_arr, i)
-                if f_imb_in_rng(px) and array.get(b4h_outer, i)
+                if f_imb_in_rng(px) and array.get(b4h_outer, i) and f_age_ok(array.get(htf_b4h_org_arr, i), age_4h_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "4H")
                     array.push(poi_cl, imb_line_faded)
@@ -2632,7 +2648,7 @@ if show_levels and render_bar
             u4h_outer = f_recompute_outer(htf_u4h_near_arr, htf_u4h_far_arr, htf_u4h_org_arr, false, 3 * 14400000)
             for i = 0 to n_u4h - 1
                 px = array.get(htf_u4h_near_arr, i)
-                if f_imb_in_rng(px) and array.get(u4h_outer, i)
+                if f_imb_in_rng(px) and array.get(u4h_outer, i) and f_age_ok(array.get(htf_u4h_org_arr, i), age_4h_d)
                     array.push(poi_px, px)
                     array.push(poi_nm, "4H")
                     array.push(poi_cl, imb_line_faded)
