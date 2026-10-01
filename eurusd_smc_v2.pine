@@ -190,8 +190,26 @@ show_zone_dbg = input.bool(false, "Zone diagnostic panel (bottom-left)", group =
      tooltip = "Counts per zone type: tracked / within visibility distance / too old, plus PDH-PDL state. For comparing timeframes.")
 
 // Zone origin (open time of its candle) still young enough to draw.
+// Clock: the bar's close on history, the real time on the live bar (a W bar's
+// open would be up to 7 days off), so the age is the same on every chart TF.
 f_age_ok(int org, int days) =>
-    days == 0 or na(org) or time - org <= days * 86400000
+    days == 0 or na(org) or math.min(time_close, timenow) - org <= days * 86400000
+
+// Expired zones are REMOVED, not just hidden: an expired zone is never drawn,
+// never recorded as liquidated (no frozen line from a year ago) and never
+// arms a setup.
+f_expire(array<float> px_arr, array<float> far_arr, array<int> org_arr, array<int> cre_arr, int days) =>
+    if days > 0
+        int i = array.size(px_arr) - 1
+        while i >= 0
+            if not f_age_ok(array.get(org_arr, i), days)
+                array.remove(px_arr, i)
+                if array.size(far_arr) > i
+                    array.remove(far_arr, i)
+                array.remove(org_arr, i)
+                array.remove(cre_arr, i)
+            i -= 1
+    0
 
 var string GALR = "Proximity Alerts"
 use_near_alert       = input.bool(true, "Alert when price nears a POI zone", group = GALR)
@@ -754,6 +772,10 @@ upW   := math.max(imWb, imWu)
 imMb   = f_ctx_import(pkM,   true,  htf_bm_near_arr,  htf_bm_far_arr,  htf_bm_org_arr,  htf_bm_cre_arr,  upM,   htf_gap_cap_m)
 imMu   = f_ctx_import(pkM,   false, htf_um_near_arr,  htf_um_far_arr,  htf_um_org_arr,  htf_um_cre_arr,  upM,   htf_gap_cap_m)
 upM   := math.max(imMb, imMu)
+f_expire(htf_b1h_near_arr, htf_b1h_far_arr, htf_b1h_org_arr, htf_b1h_cre_arr, age_1h_d)
+f_expire(htf_u1h_near_arr, htf_u1h_far_arr, htf_u1h_org_arr, htf_u1h_cre_arr, age_1h_d)
+f_expire(htf_b4h_near_arr, htf_b4h_far_arr, htf_b4h_org_arr, htf_b4h_cre_arr, age_4h_d)
+f_expire(htf_u4h_near_arr, htf_u4h_far_arr, htf_u4h_org_arr, htf_u4h_cre_arr, age_4h_d)
 
 [a60_done,  a60_t,  a60_ct,  a60_h,  a60_l]  = f_agg_step(time("60"),  ag60,  agt60)
 [a240_done, a240_t, a240_ct, a240_h, a240_l] = f_agg_step(time("240"), ag240, agt240)
@@ -1317,6 +1339,9 @@ imEQl = f_eq_import(pkEQ, false, eql_arr, eql_bar_arr, eql_cre_arr, upEQ)
 eqh_new = imEQh > upEQ
 eql_new = imEQl > upEQ
 upEQ := math.max(imEQh, imEQl)
+var float[] eq_no_far = array.new_float(0)
+f_expire(eqh_arr, eq_no_far, eqh_bar_arr, eqh_cre_arr, age_eq_d)
+f_expire(eql_arr, eq_no_far, eql_bar_arr, eql_cre_arr, age_eq_d)
 
 // Feed first, then sweep check (a level confirmed this bar can only be swept
 // by price after its confirmation time).
@@ -3484,34 +3509,3 @@ if render_bar and show_checklist and state != 0
         vol_row = use_fvg_entry ? 6 : 5
         table.cell(checklist, 0, vol_row, "Volatilidad", text_color = color.gray, text_size = size.small)
         table.cell(checklist, 1, vol_row, vol_txt,       text_color = color.white, text_size = size.small)
-
-// =============================================================
-// ALERTS
-// =============================================================
-
-alertcondition(any_hs,       title = "Sweep HIGH",         message = "Sweep HIGH - watch for bearish MSS")
-alertcondition(any_ls,       title = "Sweep LOW",          message = "Sweep LOW - watch for bullish MSS")
-alertcondition(bear_mss,     title = "MSS Bear Confirmed", message = "Bearish MSS confirmed - FVG active")
-alertcondition(bull_mss,     title = "MSS Bull Confirmed", message = "Bullish MSS confirmed - FVG active")
-alertcondition(short_valid, title = "SHORT Entry",        message = "Liquidity Algo SHORT | POI swept + CE broken | Entry: {{close}}")
-alertcondition(long_valid,  title = "LONG Entry",         message = "Liquidity Algo LONG  | POI swept + CE broken | Entry: {{close}}")
-alertcondition(eqh_new,      title = "EQH Formed",         message = "Equal High detected - liquidity pool above")
-alertcondition(eql_new,      title = "EQL Formed",         message = "Equal Low detected - liquidity pool below")
-
-// Proximity alerts - price approaching a POI zone (fires once on entry)
-alertcondition(pdh_near_alert,   title = "Price near PDH",     message = "Price approaching PDH (Previous Day High)")
-alertcondition(pdl_near_alert,   title = "Price near PDL",     message = "Price approaching PDL (Previous Day Low)")
-alertcondition(pwh_near_alert,   title = "Price near PWH",     message = "Price approaching PWH (Previous Week High)")
-alertcondition(pwl_near_alert,   title = "Price near PWL",     message = "Price approaching PWL (Previous Week Low)")
-alertcondition(eqh_near_alert,   title = "Price near EQH",     message = "Price approaching Equal Highs liquidity pool")
-alertcondition(eql_near_alert,   title = "Price near EQL",     message = "Price approaching Equal Lows liquidity pool")
-
-// Liquidation alerts - the exact bar a POI zone gets crossed/filled. The
-// "title" here becomes the alert's default name in TradingView, so a push
-// notification from one of these shows the zone that just got liquidated.
-alertcondition(pdh_liq,   title = "POI Liquidado: PDH",      message = "POI Liquidado: PDH (Previous Day High)")
-alertcondition(pdl_liq,   title = "POI Liquidado: PDL",      message = "POI Liquidado: PDL (Previous Day Low)")
-alertcondition(pwh_liq,   title = "POI Liquidado: PWH",      message = "POI Liquidado: PWH (Previous Week High)")
-alertcondition(pwl_liq,   title = "POI Liquidado: PWL",      message = "POI Liquidado: PWL (Previous Week Low)")
-alertcondition(eqh_liq,   title = "POI Liquidado: EQH",      message = "POI Liquidado: Equal Highs")
-alertcondition(eql_liq,   title = "POI Liquidado: EQL",      message = "POI Liquidado: Equal Lows")
