@@ -7,8 +7,8 @@
 
 //@version=6
 strategy(
-    title             = "Liquidity Algo v2",
-    shorttitle        = "LiqAlgoV2",
+    title             = "Liquidity Algo",
+    shorttitle        = "LiqAlgo",
     overlay           = true,
     default_qty_type  = strategy.fixed,
     default_qty_value = 1,
@@ -185,6 +185,9 @@ age_1h_d = input.int(14, "Max age 1H imbalances (days, 0 = no limit)", 0, 3650, 
      tooltip = "Older untouched zones are not drawn, identically on every timeframe. D / W / MN imbalances have no limit.")
 age_4h_d = input.int(45, "Max age 4H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS)
 age_eq_d = input.int(14, "Max age EQH / EQL (days, 0 = no limit)", 0, 3650, group = GVIS)
+
+show_zone_dbg = input.bool(false, "Zone diagnostic panel (bottom-left)", group = GVIS,
+     tooltip = "Counts per zone type: tracked / within visibility distance / too old, plus PDH-PDL state. For comparing timeframes.")
 
 // Zone origin (open time of its candle) still young enough to draw.
 f_age_ok(int org, int days) =>
@@ -2979,6 +2982,61 @@ plotshape(show_sweep and any_ls, title = "Sweep LOW",  style = shape.triangleup,
 if not use_fvg_entry and (state == 3 or state == 4) and (bar_index - sweep_bar) > mss_max_bars
     state := 0
     active_sweep_px := na
+
+// ---- Zone diagnostic panel (read-only) ----
+f_dbg_cnt(array<float> near_arr, array<int> org_arr, int days) =>
+    int n   = array.size(near_arr)
+    int nin = 0
+    int nol = 0
+    if n > 0
+        for i = 0 to n - 1
+            if f_imb_in_rng(array.get(near_arr, i))
+                nin += 1
+                if not f_age_ok(array.get(org_arr, i), days)
+                    nol += 1
+    str.tostring(n) + " / " + str.tostring(nin) + " / " + str.tostring(nol)
+
+var table dbg_tbl = table.new(position.bottom_left, 3, 16, bgcolor = color.new(color.black, 30), border_width = 1, border_color = color.gray)
+if render_bar and show_zone_dbg
+    table.cell(dbg_tbl, 0, 0, "TF " + timeframe.period + "  px " + str.tostring(close, "#.#####"), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 0, "dist " + str.tostring(max_poi_dist, "#.#####") + "  adr " + str.tostring(vis_adr, "#.#####"), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 0, "sess " + str.tostring(cur_sess_key) + "  lines " + str.tostring(array.size(managed_poi_lines)), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 1, "zona (n / en rango / viejas)", text_color = color.gray, text_size = size.small)
+    table.cell(dbg_tbl, 1, 1, "bear", text_color = color.gray, text_size = size.small)
+    table.cell(dbg_tbl, 2, 1, "bull", text_color = color.gray, text_size = size.small)
+    table.cell(dbg_tbl, 0, 2, "1H", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 2, f_dbg_cnt(htf_b1h_near_arr, htf_b1h_org_arr, age_1h_d), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 2, f_dbg_cnt(htf_u1h_near_arr, htf_u1h_org_arr, age_1h_d), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 3, "4H", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 3, f_dbg_cnt(htf_b4h_near_arr, htf_b4h_org_arr, age_4h_d), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 3, f_dbg_cnt(htf_u4h_near_arr, htf_u4h_org_arr, age_4h_d), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 4, "D", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 4, f_dbg_cnt(htf_bd_near_arr, htf_bd_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 4, f_dbg_cnt(htf_ud_near_arr, htf_ud_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 5, "W", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 5, f_dbg_cnt(htf_bw_near_arr, htf_bw_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 5, f_dbg_cnt(htf_uw_near_arr, htf_uw_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 6, "MN", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 6, f_dbg_cnt(htf_bm_near_arr, htf_bm_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 6, f_dbg_cnt(htf_um_near_arr, htf_um_org_arr, 0), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 7, "EQH / EQL (n)", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 7, str.tostring(array.size(eqh_arr)), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 7, str.tostring(array.size(eql_arr)), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 8, "PDH / PDL", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 8, str.tostring(pdh, "#.#####") + (pdh_swept ? " SW " + str.tostring(pdh_swept_s) : ""), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 8, str.tostring(pdl, "#.#####") + (pdl_swept ? " SW " + str.tostring(pdl_swept_s) : ""), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 9, "PWH / PWL", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 9, str.tostring(pwh, "#.#####") + (pwh_swept ? " SW " + str.tostring(pwh_swept_s) : ""), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 9, str.tostring(pwl, "#.#####") + (pwl_swept ? " SW " + str.tostring(pwl_swept_s) : ""), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 10, "swept 1H b/u", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 10, str.tostring(htf_b1h_swept_px, "#.#####") + " " + str.tostring(htf_b1h_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 10, str.tostring(htf_u1h_swept_px, "#.#####") + " " + str.tostring(htf_u1h_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 11, "swept 4H b/u", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 11, str.tostring(htf_b4h_swept_px, "#.#####") + " " + str.tostring(htf_b4h_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 11, str.tostring(htf_u4h_swept_px, "#.#####") + " " + str.tostring(htf_u4h_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 12, "swept EQH / EQL", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 12, str.tostring(eqh_swept_px, "#.#####") + " " + str.tostring(eqh_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 12, str.tostring(eql_swept_px, "#.#####") + " " + str.tostring(eql_swept_s), text_color = color.white, text_size = size.small)
 
 // =============================================================
 // INFO TABLE  (top right)
