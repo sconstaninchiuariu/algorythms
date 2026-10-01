@@ -3204,12 +3204,15 @@ if show_levels and render_bar
                         n_dn += 1
                         draw := n_dn <= vis_max_side
                 if draw
+                    // Both ends are at least one full chart bar apart: a zone created
+                    // inside the current bar (e.g. a 1H gap on a 4H chart) used to give
+                    // a zero-width line, which TradingView draws as a vertical line.
                     // xloc.bar_time: bar-index x1 has a "too far from current
                     // bar" limit on long-lived zones. Never a vertical line:
                     // x1 is clamped to <= now and x2 is always > x1, and every
                     // line is horizontal (y1 == y2).
-                    x1 = math.min(array.get(gr_bar, gi), time)
-                    x2 = math.max(array.get(gr_end, gi), x1 + 1)
+                    x1 = math.min(array.get(gr_bar, gi), time - chart_sec * 1000)
+                    x2 = math.max(array.get(gr_end, gi), x1 + chart_sec * 1000)
                     d_hi = array.get(gr_hi, gi)
                     new_l  = line.new(x1, d_px, x2, d_px, xloc = xloc.bar_time, extend = d_ext ? extend.right : extend.none, color = array.get(gr_cl, gi), style = line.style_solid, width = 1)
                     // Live lines: the label sits on the line a few candles to
