@@ -391,6 +391,10 @@ htf_gap_cap_d  = 60
 htf_gap_cap_w  = 60
 htf_gap_cap_m  = 24
 
+// Gaps are no longer discovered from the chart's own bars (see f_ctx_gaps):
+// f_feed only keeps the candle buffers that PDH/PDL/PWH/PWL read.
+chart_gap_feed = false
+
 // Pushes one closed source candle into its 3-candle rolling buffer and
 // records a fair value gap when the 3 candles form one: bear when candle 1's
 // low is above candle 3's high, bull the mirror. Near edge = the edge price
@@ -409,7 +413,7 @@ f_feed(int t, int cre_t, float h, float l, array<float> hb, array<float> lb, arr
             array.pop(hb)
             array.pop(lb)
             array.pop(tb)
-        if array.size(hb) == 3
+        if chart_gap_feed and array.size(hb) == 3
             hA  = array.get(hb, 0)
             lA  = array.get(lb, 0)
             hC  = array.get(hb, 2)
@@ -523,7 +527,7 @@ f_gap_cross(array<float> near_arr, array<float> far_arr, array<int> org_arr, arr
                         hit  := true
                         edge := e
                         xt   := array.get(tms, k)
-                        xo   := array.get(org_arr, i)
+                        xo   := array.get(cre_arr, i)
             // hits are ascending, so removing from the back keeps indices valid
             for k = 0 to nh - 1
                 i = array.get(hits, nh - 1 - k)
@@ -621,6 +625,135 @@ var float[] htf_um_near_arr  = array.new_float(0)
 var float[] htf_um_far_arr   = array.new_float(0)
 var int[]   htf_um_org_arr   = array.new_int(0)
 var int[]   htf_um_cre_arr   = array.new_int(0)
+
+// =============================================================
+// ZONE DISCOVERY IN EACH ZONE'S OWN TIMEFRAME
+// =============================================================
+// Every imbalance list is built by request.security on the zone's own
+// timeframe (1H on 1H candles, W on weekly candles ...), with that
+// timeframe's own history. The chart's loaded history (a few weeks on 1m,
+// years on 1H, decades on D) and its bar size no longer decide which zones
+// exist, so every chart timeframe receives exactly the same list. On the
+// chart, zones are imported once they exist (their 3rd candle has closed)
+// and from then on the usual chart-side engine (15m sweep clock, swept
+// records, session freeze, sweep arming) handles them unchanged.
+//
+// Packed result: [n_bear, n_bull, bear near.., far.., org.., cre..,
+// bull near.., far.., org.., cre..].
+f_ctx_gaps(int cap) =>
+    var float[] bn = array.new_float(0)
+    var float[] bf = array.new_float(0)
+    var float[] bo = array.new_float(0)
+    var float[] bc = array.new_float(0)
+    var float[] un = array.new_float(0)
+    var float[] uf = array.new_float(0)
+    var float[] uo = array.new_float(0)
+    var float[] uc = array.new_float(0)
+    // Touched by this candle (gaps that existed before it) -> gone.
+    int i = array.size(bn) - 1
+    while i >= 0
+        if time >= array.get(bc, i) and high >= array.get(bn, i)
+            array.remove(bn, i)
+            array.remove(bf, i)
+            array.remove(bo, i)
+            array.remove(bc, i)
+        i -= 1
+    i := array.size(un) - 1
+    while i >= 0
+        if time >= array.get(uc, i) and low <= array.get(un, i)
+            array.remove(un, i)
+            array.remove(uf, i)
+            array.remove(uo, i)
+            array.remove(uc, i)
+        i -= 1
+    // Same 3-candle rule as before: candle 1 = [2], candle 3 = this one.
+    if not na(high[2]) and not na(time_close)
+        if low[2] > high and (low[2] - high) >= htf_fvg_min
+            array.push(bn, high)
+            array.push(bf, low[2])
+            array.push(bo, time[1])
+            array.push(bc, time_close)
+            if array.size(bn) > cap
+                array.shift(bn)
+                array.shift(bf)
+                array.shift(bo)
+                array.shift(bc)
+        if high[2] < low and (low - high[2]) >= htf_fvg_min
+            array.push(un, low)
+            array.push(uf, high[2])
+            array.push(uo, time[1])
+            array.push(uc, time_close)
+            if array.size(un) > cap
+                array.shift(un)
+                array.shift(uf)
+                array.shift(uo)
+                array.shift(uc)
+    pk = array.new_float(0)
+    array.push(pk, array.size(bn))
+    array.push(pk, array.size(un))
+    array.concat(pk, bn)
+    array.concat(pk, bf)
+    array.concat(pk, bo)
+    array.concat(pk, bc)
+    array.concat(pk, un)
+    array.concat(pk, uf)
+    array.concat(pk, uo)
+    array.concat(pk, uc)
+    pk
+
+// Imports the zones of one side that came into existence after `upto` and
+// have already closed (cre <= this bar's close: a still-forming HTF candle is
+// never imported). Returns the newest creation time imported.
+f_ctx_import(array<float> pk, bool bear, array<float> near_arr, array<float> far_arr, array<int> org_arr, array<int> cre_arr, int upto, int cap) =>
+    int mx = upto
+    if not na(pk)
+        if array.size(pk) >= 2
+            nb = int(array.get(pk, 0))
+            nu = int(array.get(pk, 1))
+            n  = bear ? nb : nu
+            b  = bear ? 2 : 2 + 4 * nb
+            if n > 0 and array.size(pk) >= b + 4 * n
+                for k = 0 to n - 1
+                    c = int(array.get(pk, b + 3 * n + k))
+                    if c > upto and c <= time_close
+                        array.push(near_arr, array.get(pk, b + k))
+                        array.push(far_arr,  array.get(pk, b + n + k))
+                        array.push(org_arr,  int(array.get(pk, b + 2 * n + k)))
+                        array.push(cre_arr,  c)
+                        mx := math.max(mx, c)
+                        if array.size(near_arr) > cap
+                            array.shift(near_arr)
+                            array.shift(far_arr)
+                            array.shift(org_arr)
+                            array.shift(cre_arr)
+    mx
+
+pk60  = request.security(syminfo.tickerid, "60",  f_ctx_gaps(htf_gap_cap_1h), lookahead = barmerge.lookahead_off)
+pk240 = request.security(syminfo.tickerid, "240", f_ctx_gaps(htf_gap_cap_4h), lookahead = barmerge.lookahead_off)
+pkD   = request.security(syminfo.tickerid, "D",   f_ctx_gaps(htf_gap_cap_d),  lookahead = barmerge.lookahead_off)
+pkW   = request.security(syminfo.tickerid, "W",   f_ctx_gaps(htf_gap_cap_w),  lookahead = barmerge.lookahead_off)
+pkM   = request.security(syminfo.tickerid, "M",   f_ctx_gaps(htf_gap_cap_m),  lookahead = barmerge.lookahead_off)
+
+var int up60  = 0
+var int up240 = 0
+var int upD   = 0
+var int upW   = 0
+var int upM   = 0
+im60b  = f_ctx_import(pk60,  true,  htf_b1h_near_arr, htf_b1h_far_arr, htf_b1h_org_arr, htf_b1h_cre_arr, up60,  htf_gap_cap_1h)
+im60u  = f_ctx_import(pk60,  false, htf_u1h_near_arr, htf_u1h_far_arr, htf_u1h_org_arr, htf_u1h_cre_arr, up60,  htf_gap_cap_1h)
+up60  := math.max(im60b, im60u)
+im240b = f_ctx_import(pk240, true,  htf_b4h_near_arr, htf_b4h_far_arr, htf_b4h_org_arr, htf_b4h_cre_arr, up240, htf_gap_cap_4h)
+im240u = f_ctx_import(pk240, false, htf_u4h_near_arr, htf_u4h_far_arr, htf_u4h_org_arr, htf_u4h_cre_arr, up240, htf_gap_cap_4h)
+up240 := math.max(im240b, im240u)
+imDb   = f_ctx_import(pkD,   true,  htf_bd_near_arr,  htf_bd_far_arr,  htf_bd_org_arr,  htf_bd_cre_arr,  upD,   htf_gap_cap_d)
+imDu   = f_ctx_import(pkD,   false, htf_ud_near_arr,  htf_ud_far_arr,  htf_ud_org_arr,  htf_ud_cre_arr,  upD,   htf_gap_cap_d)
+upD   := math.max(imDb, imDu)
+imWb   = f_ctx_import(pkW,   true,  htf_bw_near_arr,  htf_bw_far_arr,  htf_bw_org_arr,  htf_bw_cre_arr,  upW,   htf_gap_cap_w)
+imWu   = f_ctx_import(pkW,   false, htf_uw_near_arr,  htf_uw_far_arr,  htf_uw_org_arr,  htf_uw_cre_arr,  upW,   htf_gap_cap_w)
+upW   := math.max(imWb, imWu)
+imMb   = f_ctx_import(pkM,   true,  htf_bm_near_arr,  htf_bm_far_arr,  htf_bm_org_arr,  htf_bm_cre_arr,  upM,   htf_gap_cap_m)
+imMu   = f_ctx_import(pkM,   false, htf_um_near_arr,  htf_um_far_arr,  htf_um_org_arr,  htf_um_cre_arr,  upM,   htf_gap_cap_m)
+upM   := math.max(imMb, imMu)
 
 [a60_done,  a60_t,  a60_ct,  a60_h,  a60_l]  = f_agg_step(time("60"),  ag60,  agt60)
 [a240_done, a240_t, a240_ct, a240_h, a240_l] = f_agg_step(time("240"), ag240, agt240)
@@ -1061,20 +1194,129 @@ f_eqh_nearest(array<float> px_arr, array<int> bar_arr) =>
                 best_bar := array.get(bar_arr, i)
     [best, best_bar]
 
-eqh_new = false
-eql_new = false
-if hi_eql
-    ne = array.size(lte)
-    if ne > 0
-        for i = 0 to ne - 1
-            if i < ne - 1 or barstate.isconfirmed
-                [nh_i, nl_i] = f_eql_feed(array.get(lte, i), array.get(lce, i), array.get(lhe, i), array.get(lle, i))
-                eqh_new := eqh_new or nh_i
-                eql_new := eql_new or nl_i
-else if ae_done
-    [nh_a, nl_a] = f_eql_feed(ae_t, ae_ct, ae_h, ae_l)
-    eqh_new := nh_a
-    eql_new := nl_a
+// EQH/EQL discovered in eql_ref_tf's own context (same rules as
+// f_eql_pivot / f_eql_feed / f_eqh_push), so the list does not depend on the
+// chart's history either. Packed: [n_eqh, n_eql, h px.., h bar.., h cre..,
+// l px.., l bar.., l cre..].
+f_ctx_eq() =>
+    var float[] hp = array.new_float(0)
+    var float[] hb = array.new_float(0)
+    var float[] hc = array.new_float(0)
+    var float[] lp = array.new_float(0)
+    var float[] lb = array.new_float(0)
+    var float[] lc = array.new_float(0)
+    var float[] swh = array.new_float(0)
+    var float[] swl = array.new_float(0)
+    int i = array.size(hp) - 1
+    while i >= 0
+        if time >= array.get(hc, i) and high >= array.get(hp, i)
+            array.remove(hp, i)
+            array.remove(hb, i)
+            array.remove(hc, i)
+        i -= 1
+    i := array.size(lp) - 1
+    while i >= 0
+        if time >= array.get(lc, i) and low <= array.get(lp, i)
+            array.remove(lp, i)
+            array.remove(lb, i)
+            array.remove(lc, i)
+        i -= 1
+    if use_eql and bar_index >= 2 * sw_len and not na(time_close)
+        ch = high[sw_len]
+        cl = low[sw_len]
+        bool okh = true
+        bool okl = true
+        for k = 1 to sw_len
+            if high[sw_len - k] >= ch or high[sw_len + k] >= ch
+                okh := false
+            if low[sw_len - k] <= cl or low[sw_len + k] <= cl
+                okl := false
+        if okh
+            sz = array.size(swh)
+            if sz > 0
+                for j = 0 to sz - 1
+                    if math.abs(ch - array.get(swh, j)) <= eql_tol
+                        bool dup = false
+                        nh = array.size(hp)
+                        if nh > 0
+                            for q = 0 to nh - 1
+                                if math.abs(ch - array.get(hp, q)) <= eql_tol
+                                    dup := true
+                        if not dup
+                            array.push(hp, ch)
+                            array.push(hb, time[sw_len])
+                            array.push(hc, time_close)
+                            if array.size(hp) > 100
+                                array.shift(hp)
+                                array.shift(hb)
+                                array.shift(hc)
+                        break
+            if array.size(swh) >= eql_lookback
+                array.shift(swh)
+            array.push(swh, ch)
+        if okl
+            sz = array.size(swl)
+            if sz > 0
+                for j = 0 to sz - 1
+                    if math.abs(cl - array.get(swl, j)) <= eql_tol
+                        bool dup = false
+                        nl = array.size(lp)
+                        if nl > 0
+                            for q = 0 to nl - 1
+                                if math.abs(cl - array.get(lp, q)) <= eql_tol
+                                    dup := true
+                        if not dup
+                            array.push(lp, cl)
+                            array.push(lb, time[sw_len])
+                            array.push(lc, time_close)
+                            if array.size(lp) > 100
+                                array.shift(lp)
+                                array.shift(lb)
+                                array.shift(lc)
+                        break
+            if array.size(swl) >= eql_lookback
+                array.shift(swl)
+            array.push(swl, cl)
+    pk = array.new_float(0)
+    array.push(pk, array.size(hp))
+    array.push(pk, array.size(lp))
+    array.concat(pk, hp)
+    array.concat(pk, hb)
+    array.concat(pk, hc)
+    array.concat(pk, lp)
+    array.concat(pk, lb)
+    array.concat(pk, lc)
+    pk
+
+f_eq_import(array<float> pk, bool is_high, array<float> px_arr, array<int> bar_arr, array<int> cre_arr, int upto) =>
+    int mx = upto
+    if not na(pk)
+        if array.size(pk) >= 2
+            nh = int(array.get(pk, 0))
+            nl = int(array.get(pk, 1))
+            n  = is_high ? nh : nl
+            b  = is_high ? 2 : 2 + 3 * nh
+            if n > 0 and array.size(pk) >= b + 3 * n
+                for k = 0 to n - 1
+                    c = int(array.get(pk, b + 2 * n + k))
+                    if c > upto and c <= time_close
+                        array.push(px_arr,  array.get(pk, b + k))
+                        array.push(bar_arr, int(array.get(pk, b + n + k)))
+                        array.push(cre_arr, c)
+                        mx := math.max(mx, c)
+                        if array.size(px_arr) > 100
+                            array.shift(px_arr)
+                            array.shift(bar_arr)
+                            array.shift(cre_arr)
+    mx
+
+pkEQ = request.security(syminfo.tickerid, eql_ref_tf, f_ctx_eq(), lookahead = barmerge.lookahead_off)
+var int upEQ = 0
+imEQh = f_eq_import(pkEQ, true,  eqh_arr, eqh_bar_arr, eqh_cre_arr, upEQ)
+imEQl = f_eq_import(pkEQ, false, eql_arr, eql_bar_arr, eql_cre_arr, upEQ)
+eqh_new = imEQh > upEQ
+eql_new = imEQl > upEQ
+upEQ := math.max(imEQh, imEQl)
 
 // Feed first, then sweep check (a level confirmed this bar can only be swept
 // by price after its confirmation time).
@@ -2586,7 +2828,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 58)
-                    array.push(poi_bar, array.get(htf_b1h_org_arr, i))
+                    array.push(poi_bar, array.get(htf_b1h_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, true)
@@ -2601,7 +2843,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 59)
-                    array.push(poi_bar, array.get(htf_u1h_org_arr, i))
+                    array.push(poi_bar, array.get(htf_u1h_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
@@ -2642,7 +2884,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 56)
-                    array.push(poi_bar, array.get(htf_b4h_org_arr, i))
+                    array.push(poi_bar, array.get(htf_b4h_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, true)
@@ -2657,7 +2899,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 57)
-                    array.push(poi_bar, array.get(htf_u4h_org_arr, i))
+                    array.push(poi_bar, array.get(htf_u4h_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
@@ -2695,7 +2937,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 54)
-                    array.push(poi_bar, array.get(htf_bd_org_arr, i))
+                    array.push(poi_bar, array.get(htf_bd_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, true)
@@ -2710,7 +2952,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 55)
-                    array.push(poi_bar, array.get(htf_ud_org_arr, i))
+                    array.push(poi_bar, array.get(htf_ud_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
@@ -2748,7 +2990,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 52)
-                    array.push(poi_bar, array.get(htf_bw_org_arr, i))
+                    array.push(poi_bar, array.get(htf_bw_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, true)
@@ -2763,7 +3005,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 53)
-                    array.push(poi_bar, array.get(htf_uw_org_arr, i))
+                    array.push(poi_bar, array.get(htf_uw_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
@@ -2801,7 +3043,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 50)
-                    array.push(poi_bar, array.get(htf_bm_org_arr, i))
+                    array.push(poi_bar, array.get(htf_bm_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, true)
@@ -2816,7 +3058,7 @@ if show_levels and render_bar
                     array.push(poi_cl, imb_line_faded)
                     array.push(poi_tx, imb_text_solid)
                     array.push(poi_pr, 51)
-                    array.push(poi_bar, array.get(htf_um_org_arr, i))
+                    array.push(poi_bar, array.get(htf_um_cre_arr, i))
                     array.push(poi_ext, true)
                     array.push(poi_end, time)
                     array.push(poi_hi, false)
