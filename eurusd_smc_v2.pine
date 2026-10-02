@@ -136,6 +136,8 @@ max_sl     = input.float(0.0050, "Max SL Distance",  0.0005, 0.0200, 0.0001, gro
 min_sl     = input.float(0.0003, "Min SL Distance",  0.0001, 0.0020, 0.0001, group = GRSK)
 max_day_tr = input.int(4,        "Max Trades / Day (overall ceiling)", 1, 10,   group = GRSK)
 sess_max_trades = input.int(2,   "Max Trades per Session (London/NY only)", 1, 5, group = GRSK)
+second_chance = input.bool(true, "Second chance after a stop-out (same session, same zone)", group = GRSK,
+     tooltip = "If a trade ends in its stop loss and structure breaks again (new CE) inside the SAME session, one more entry is allowed on that zone. Once per liquidated zone; the per-session and per-day trade caps still apply.")
 cap_sl_to_max = input.bool(true, "Cap SL at Max Distance instead of skipping trade", group = GRSK)
 fixed_cap  = input.float(100000, "Fixed Capital (non-compounded)",       group = GRSK)
 
@@ -1688,6 +1690,8 @@ var int   mss_bar      = 0
 // own line can turn green with a check instead of just disappearing once
 // swept — it stays green through the whole sweep -> MSS -> entry cycle.
 var float active_sweep_px = na
+var float cyc_sweep_px    = na   // the zone of the last entry, for its second chance
+var bool  chance_used     = true
 
 // The entry FVG is drawn as two plain dashed lines (top edge + bottom edge)
 // instead of a filled box — a horizontal line (y1==y2) can never develop the
@@ -1834,6 +1838,70 @@ any_ls = (ls_pdl or ls_pwl or ls_eql or ls_imb)  and htf_ok_bull and can_trade a
 hs_imb_gated = hs_imb and htf_ok_bear and can_trade and is_exec_tf
 ls_imb_gated = ls_imb and htf_ok_bull and can_trade and is_exec_tf
 
+// SECOND CHANCE. A trade that ends in its stop loss, inside the same session
+// that armed it, re-arms the same setup ONCE: price just ran through the stop
+// (a new extreme), so the swing that push started from is the new CE and a
+// close beyond it is a regular entry. Seeded exactly like a sweep arm, from
+// the stop-out bar. The session / day trade caps still gate the entry itself.
+last_tr     = strategy.closedtrades - 1
+stopped_out = second_chance and last_tr >= 0 and strategy.closedtrades > nz(strategy.closedtrades[1]) and strategy.closedtrades.profit(last_tr) < 0
+same_cyc_sess = (cyc_sess_asia and in_asia) or (cyc_sess_lon and in_london) or (cyc_sess_ny and in_ny)
+rearm_ok    = state == 0 and not chance_used and can_trade and is_exec_tf and same_cyc_sess
+
+if rearm_ok and stopped_out and strategy.closedtrades.size(last_tr) < 0
+    chance_used   := true
+    state         := 1
+    sweep_bar     := bar_index
+    sweep_hi      := high
+    ce_ext_hi     := high
+    ce_ext_hi_bar := bar_index
+    [rc_b, rc_b_bar, rc_b_ok] = f_ce_ref(true, 0)
+    mss_ref_bear  := na(rc_b) ? low : rc_b
+    mss_ref_bar   := na(rc_b_bar) ? bar_index : rc_b_bar
+    state_bar     := bar_index
+    cyc_touched   := false
+    cyc_close_ok  := false
+    fvg_top := na
+    fvg_bot := na
+    [tmp_fvg_l1, tmp_fvg_l2, tmp_fvg_lb] = f_fvg_clear()
+    fvg_top_line := tmp_fvg_l1
+    fvg_bot_line := tmp_fvg_l2
+    fvg_lbl := tmp_fvg_lb
+    active_sweep_px := cyc_sweep_px
+    line.delete(mss_ref_line)
+    label.delete(mss_ref_lbl)
+    label.delete(mss_ref_org)
+    mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bear, bar_index + 1, mss_ref_bear, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
+    mss_ref_lbl  := label.new(bar_index, mss_ref_bear, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
+    mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bear, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
+
+if rearm_ok and stopped_out and strategy.closedtrades.size(last_tr) > 0
+    chance_used   := true
+    state         := 2
+    sweep_bar     := bar_index
+    sweep_lo      := low
+    ce_ext_lo     := low
+    ce_ext_lo_bar := bar_index
+    [rc_u, rc_u_bar, rc_u_ok] = f_ce_ref(false, 0)
+    mss_ref_bull  := na(rc_u) ? high : rc_u
+    mss_ref_bar   := na(rc_u_bar) ? bar_index : rc_u_bar
+    state_bar     := bar_index
+    cyc_touched   := false
+    cyc_close_ok  := false
+    fvg_top := na
+    fvg_bot := na
+    [tmp_fvg_l1, tmp_fvg_l2, tmp_fvg_lb] = f_fvg_clear()
+    fvg_top_line := tmp_fvg_l1
+    fvg_bot_line := tmp_fvg_l2
+    fvg_lbl := tmp_fvg_lb
+    active_sweep_px := cyc_sweep_px
+    line.delete(mss_ref_line)
+    label.delete(mss_ref_lbl)
+    label.delete(mss_ref_org)
+    mss_ref_line := line.new(nz(mss_ref_bar, bar_index), mss_ref_bull, bar_index + 1, mss_ref_bull, extend = extend.right, color = color.yellow, style = line.style_solid, width = 2)
+    mss_ref_lbl  := label.new(bar_index, mss_ref_bull, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
+    mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bull, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
+
 if (state == 0 and any_hs) or (state == 2 and hs_imb_gated)
     state        := 1
     sweep_bar    := bar_index
@@ -1844,6 +1912,7 @@ if (state == 0 and any_hs) or (state == 2 and hs_imb_gated)
     // the stop anchor; it then keeps tracking the reaction extreme while the
     // bot waits for structure (equivalent to maxAfterSweepPDH in the working
     // PDH/PDL strategy).
+    chance_used  := false
     sweep_hi     := high
     // CE = the low the push that took the liquidity started from (f_ce_ref).
     // Price CLOSING below it is the break.
@@ -1888,6 +1957,7 @@ if (state == 0 and any_ls) or (state == 1 and ls_imb_gated)
     cyc_sess_asia := in_asia
     cyc_sess_lon  := in_london
     cyc_sess_ny   := in_ny
+    chance_used  := false
     sweep_lo     := low
     // Mirror: the high the push down that took the liquidity started from.
     ce_ext_lo     := low
@@ -2285,6 +2355,7 @@ if short_valid and order_bar
     if in_ny
         ny_session_trades += 1
     state := 0
+    cyc_sweep_px := active_sweep_px
     active_sweep_px := na
     // ce_lbl is deliberately left on the chart, as is mss_ref_line (now
     // frozen origin-candle-to-break-candle): the visual proof of why the
@@ -2304,6 +2375,7 @@ if long_valid and order_bar
     if in_ny
         ny_session_trades += 1
     state := 0
+    cyc_sweep_px := active_sweep_px
     active_sweep_px := na
     // ce_lbl is deliberately left on the chart, as is mss_ref_line (now
     // frozen origin-candle-to-break-candle): the visual proof of why the

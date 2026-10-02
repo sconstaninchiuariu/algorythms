@@ -93,6 +93,7 @@ input double RRRatio        = 2.0;
 input double MaxSL          = 0.0050;
 input double MinSL          = 0.0003;
 input bool   CapSLToMax     = true;
+input bool   SecondChance   = true;   // after a stop-out, re-arm the same setup once (same session)
 input int    MaxTradesPerDay     = 4;
 input int    MaxTradesPerSession = 2;   // London and NY each, independently
 input double FixedCapital   = 100000;   // non-compounded risk base
@@ -130,6 +131,10 @@ double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from 
 datetime ceExtHiT = 0, ceExtLoT = 0;         // candle that printed it
 double   atrM1 = 0; int atrCount = 0; double trSum = 0;  // Wilder ATR(14) on M1
 double   activeSweepPx = 0;
+double   cycSweepPx    = 0;      // zone of the last entry (for its second chance)
+bool     chanceUsed    = true;
+bool     slJustHit     = false;  // the last closed deal (seen this bar) was a loss
+bool     slWasShort    = false;
 
 int      attempt = 1;
 
@@ -447,6 +452,7 @@ double CalcLots(double slDistancePrice)
 // loss -> one step up (capped at 6). Mirrors the Pine was_in_trade block.
 void UpdateAttemptFromLastDeal()
   {
+   slJustHit = false;
    if(!HistorySelect(TimeCurrent()-86400*3, TimeCurrent())) return;
    int total = HistoryDealsTotal();
    if(total == 0) return;
@@ -466,6 +472,8 @@ void UpdateAttemptFromLastDeal()
                   + HistoryDealGetDouble(lastDealTicket, DEAL_SWAP)
                   + HistoryDealGetDouble(lastDealTicket, DEAL_COMMISSION);
    attempt = (profit > 0) ? 1 : MathMin(attempt+1, 6);
+   slJustHit  = (profit < 0);
+   slWasShort = (HistoryDealGetInteger(lastDealTicket, DEAL_TYPE) == DEAL_TYPE_BUY);   // a buy closes a short
   }
 
 //======================================================================
@@ -525,6 +533,33 @@ void ProcessNewM1Bar(const M1Bar &bar)
    // breaks the statistical premise sessions are meant to provide.
    bool inAnySession = inAsiaNow || inLondonNow || inNyNow;
 
+   // --- SECOND CHANCE: a stop-out inside the arming session re-arms the same
+   //     setup once; the new extreme's own swing is the new CE ---
+   if(SecondChance && state == 0 && !chanceUsed && slJustHit && canTrade && inAnySession &&
+      ((cycSessAsia && inAsiaNow) || (cycSessLondon && inLondonNow) || (cycSessNy && inNyNow)))
+     {
+      chanceUsed = true;
+      sweepBarTime = bar.t;
+      activeSweepPx = cycSweepPx;
+      double lv2 = 0; datetime lt2 = bar.t;
+      if(slWasShort)
+        {
+         state = 1;
+         sweepHi = bar.h;
+         ceExtHi = bar.h; ceExtHiT = bar.t;
+         mssRefBear = (CeRef(true, 1, lv2, lt2) >= 0) ? lv2 : bar.l;
+         mssRefBarTime = lt2;
+        }
+      else
+        {
+         state = 2;
+         sweepLo = bar.l;
+         ceExtLo = bar.l; ceExtLoT = bar.t;
+         mssRefBull = (CeRef(false, 1, lv2, lt2) >= 0) ? lv2 : bar.h;
+         mssRefBarTime = lt2;
+        }
+     }
+
    // --- SWEEP: arm the state machine the instant a level is crossed ---
    double lvl;
    if(state == 0 && canTrade && inAnySession)
@@ -534,6 +569,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
          state = 1;
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
+         chanceUsed = false;
          sweepHi = bar.h;
          ceExtHi = bar.h; ceExtHiT = bar.t;
          double lv = 0; datetime lt = bar.t;
@@ -546,6 +582,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
          state = 2;
          sweepBarTime = bar.t;
          cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
+         chanceUsed = false;
          sweepLo = bar.l;
          ceExtLo = bar.l; ceExtLoT = bar.t;
          double lv = 0; datetime lt = bar.t;
@@ -644,6 +681,7 @@ void ProcessNewM1Bar(const M1Bar &bar)
                if(inLondonNow) lonSessionTrades++;
                if(inNyNow)     nySessionTrades++;
               }
+            cycSweepPx = activeSweepPx;
             state = 0; activeSweepPx = 0;
            }
         }
