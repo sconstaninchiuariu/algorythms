@@ -3058,9 +3058,12 @@ if show_levels and render_bar
                     // ends where the line ends.
                     lb_x   = d_ext ? time + (lbl_off_bars + 1) * chart_sec * 1000 : x2
                     lb_sty = d_ext ? (d_hi ? label.style_label_lower_left : label.style_label_upper_left) : (d_hi ? label.style_label_lower_right : label.style_label_upper_right)
-                    new_lb = label.new(lb_x, d_px, array.get(gr_nm, gi), xloc = xloc.bar_time, style = lb_sty, color = color.new(color.black, 100), textcolor = array.get(gr_tx, gi), size = size.small)
                     array.push(managed_poi_lines,  new_l)
-                    array.push(managed_poi_labels, new_lb)
+                    // Minimal text: live lines are named; a frozen (swept) line
+                    // is named only while it is the active setup's zone (green).
+                    if d_ext or array.get(gr_cl, gi) == active_col
+                        new_lb = label.new(lb_x, d_px, array.get(gr_nm, gi), xloc = xloc.bar_time, style = lb_sty, color = color.new(color.black, 100), textcolor = array.get(gr_tx, gi), size = size.small)
+                        array.push(managed_poi_labels, new_lb)
 
 // Sweep markers — the bar this evaluates on IS the candle that crossed the
 // level, so no offset is needed any more.
@@ -3303,6 +3306,10 @@ f_chk_cell(bool done, bool applicable) =>
     txt = not applicable ? "N/D" : done ? "✓" : "⏳"
     col = not applicable ? color.gray : done ? color.lime : color.orange
     [txt, col]
+
+// Nothing to show while idle: the last panel must not stay on screen.
+if render_bar and show_checklist and state == 0
+    table.clear(checklist, 0, 0, 1, 6)
 
 if render_bar and show_checklist and state != 0
     dir_str = (state == 1 or state == 3) ? "BAJISTA" : "ALCISTA"
