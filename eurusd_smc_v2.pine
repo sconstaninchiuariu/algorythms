@@ -719,6 +719,14 @@ f_ctx_gaps(int cap) =>
     array.concat(pk, uc)
     pk
 
+// A zone exists only once the candle that completes it has CLOSED. On a live,
+// unconfirmed bar request.security returns the forming bar (on 1H chart / 1H
+// zone that is the chart bar itself, whose close equals this bar's time_close),
+// so the real clock decides; on history and on the confirming tick the bar's
+// own close does.
+f_zone_closed(int c) =>
+    barstate.isrealtime and not barstate.isconfirmed ? c <= timenow : c <= time_close
+
 // Imports the zones of one side that came into existence after `upto` and
 // have already closed (cre <= this bar's close: a still-forming HTF candle is
 // never imported). Returns the newest creation time imported.
@@ -733,7 +741,7 @@ f_ctx_import(array<float> pk, bool bear, array<float> near_arr, array<float> far
             if n > 0 and array.size(pk) >= b + 4 * n
                 for k = 0 to n - 1
                     c = int(array.get(pk, b + 3 * n + k))
-                    if c > upto and c <= time_close
+                    if c > upto and f_zone_closed(c)
                         array.push(near_arr, array.get(pk, b + k))
                         array.push(far_arr,  array.get(pk, b + n + k))
                         array.push(org_arr,  int(array.get(pk, b + 2 * n + k)))
@@ -1321,7 +1329,7 @@ f_eq_import(array<float> pk, bool is_high, array<float> px_arr, array<int> bar_a
             if n > 0 and array.size(pk) >= b + 3 * n
                 for k = 0 to n - 1
                     c = int(array.get(pk, b + 2 * n + k))
-                    if c > upto and c <= time_close
+                    if c > upto and f_zone_closed(c)
                         array.push(px_arr,  array.get(pk, b + k))
                         array.push(bar_arr, int(array.get(pk, b + n + k)))
                         array.push(cre_arr, c)
