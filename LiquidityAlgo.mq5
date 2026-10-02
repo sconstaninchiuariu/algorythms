@@ -67,7 +67,7 @@ input group "=== Liquidity Levels ==="
 input bool   UsePDHL       = true;
 input bool   UsePWHL       = true;
 input bool   UseEQL        = true;
-input double SweepBuffer   = 0.0002;   // SL padding beyond the sweep wick
+input double SweepBuffer   = 0.0;        // SL padding beyond the sweep wick
 
 input group "=== Equal Highs / Lows ==="
 input double EqlTolerance      = 0.0005;

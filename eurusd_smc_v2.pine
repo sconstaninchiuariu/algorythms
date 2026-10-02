@@ -92,7 +92,7 @@ var string GLIQ = "Liquidity Levels (HTF POIs)"
 use_pdhl  = input.bool(true,    "PDH / PDL (Previous Day)",  group = GLIQ)
 use_pwhl  = input.bool(true,    "PWH / PWL (Previous Week)", group = GLIQ)
 sw_len    = input.int(10,       "EQH/EQL Pivot Strength (ref-TF candles each side)",  2, 50, group = GLIQ)
-sweep_buf = input.float(0.0002, "Sweep Buffer", 0.00005, 0.001, 0.00001, group = GLIQ)
+sweep_buf = input.float(0.0, "Stop Padding (0 = stop exactly at the last extreme)", 0.0, 0.001, 0.00001, group = GLIQ)
 
 var string GMSS = "MSS Settings"
 mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the sweep)", 5, 500, group = GMSS, tooltip = "How long the bot keeps hunting for the structure break after a zone is liquidated. Price often sweeps a level and then keeps running for another 50-80 bars before the actual reaction, so a short deadline kills the setup right before the trade it was waiting for. A cycle is also abandoned immediately if the session it armed in ends first (Asia/London/NY) — it never waits across a session boundary — so this deadline mainly matters for setups that time out within the same session.")
