@@ -1,55 +1,72 @@
 //+------------------------------------------------------------------+
 //|                                              LiquidityAlgo.mq5   |
-//|  Port of the "Liquidity Algo v2" Pine Script strategy to MQL5.   |
-//|                                                                    |
-//|  Ported for backtesting depth only: MetaTrader 5's Strategy       |
-//|  Tester typically keeps far more M1 history per symbol than       |
-//|  TradingView's free/basic intraday forex feeds, which is the      |
-//|  whole reason for this port (see chat: TradingView capped M1      |
-//|  history to ~10 days for this symbol/plan).                       |
-//|                                                                    |
-//|  Everything VISUAL from the Pine version (POI lines, the CE       |
-//|  marker, the checklist/info/stats tables, alerts) is intentionally|
-//|  NOT ported — none of that affects trading logic, and MT5's own   |
-//|  Strategy Tester report (Results / Graph / Report tabs) already   |
-//|  gives you the equity curve, win rate, profit factor, drawdown,   |
-//|  and trade list that those Pine tables were approximating.        |
-//|                                                                    |
-//|  The TRADING LOGIC below mirrors the final, validated Pine        |
-//|  version bar-for-bar:                                             |
-//|    1. A liquidity level (PDH/PDL, PWH/PWL,                        |
-//|       EQH/EQL) is crossed for the first time this period -> the   |
-//|       sweep arms (state 1 = bearish setup, state 2 = bullish).    |
-//|    2. The CE (cambio estructural) is the swing that STARTED the  |
-//|       final leg into the liquidity: the low the last push up      |
-//|       began from (short) / the high the last push down began from |
-//|       (long). A pullback counts as a leg start only if it is at   |
-//|       least CeLegPct % of the leg that followed AND CeMinAtr x    |
-//|       ATR14. It moves only when a candle CLOSES beyond the current |
-//|       extreme (wicks beyond it are annulled) and the new push's   |
-//|       own starting swing is more recent (see CeRef).              |
-//|    3. Price closing back through the CE level confirms the break |
-//|       -> a PENDING entry (state 3/4): SL/TP are already frozen to |
-//|       the reaction's real wick extreme, and the order fires the   |
-//|       moment London or New York is next open (bounded by the same |
-//|       MssMaxBars-from-sweep deadline used for the earlier hunt).  |
-//|    4. Position size comes from the tiered risk ladder (1.00% up   |
-//|       to 1.55%, one step per consecutive loss, reset to 1.00% on  |
-//|       a win) applied to FixedCapital, divided by the real stop    |
-//|       distance in price.                                          |
+//|  MQL5 port of the "Liquidity Algo" Pine Script v6 strategy       |
+//|  (eurusd_smc_v2.pine, the version tested on TradingView).        |
+//|                                                                  |
+//|  Only the TRADING DECISIONS are ported (no drawings, tables or   |
+//|  alerts). Every rule below follows the Pine code in the same     |
+//|  order, bar by bar, on CLOSED M1 bars:                           |
+//|                                                                  |
+//|   1. Zones: PDH/PDL, PWH/PWL, EQH/EQL and the 1H/4H/D/W/MN       |
+//|      imbalances. Each list is built in its own timeframe (like   |
+//|      Pine's request.security contexts) and imported once the     |
+//|      completing candle has closed; the M1 bar then consumes      |
+//|      every zone price traded BEYOND (LiqPenTicks).               |
+//|   2. A zone consumed while a session is open arms the setup      |
+//|      (state 1 = bearish, 2 = bullish); an imbalance touch can    |
+//|      override a live cycle of the opposite side.                 |
+//|   3. CE = the swing that started the final leg into the          |
+//|      liquidity (CeRef); it moves only when a candle CLOSES       |
+//|      beyond the extreme. A close through it = structure break.   |
+//|   4. Default mode (Pine use_fvg_entry = false): the break is the |
+//|      entry, fired while London/NY is open. The imbalance-retest  |
+//|      mode of Pine is NOT ported.                                 |
+//|   5. Second chance, tiered risk ladder, per-session/day caps,    |
+//|      SL at the reaction extreme, TP = SL x RR.                   |
+//|                                                                  |
+//|  Not compiled or run by the author: see the validation protocol  |
+//|  (LogParity events) to compare against the TradingView run.      |
 //+------------------------------------------------------------------+
 #property copyright "Liquidity Algo"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
 //======================================================================
-// INPUTS
+// ENUMS
 //======================================================================
+enum ENUM_SRV_CLOCK
+  {
+   SRV_NYCLOSE_USDST = 0,   // server = New York + 7h (GMT+2 winter / GMT+3 summer, US DST)
+   SRV_EU_DST        = 1,   // GMT+2 winter / GMT+3 summer, EU DST
+   SRV_FIXED         = 2    // fixed offset (ServerFixedUtcOffsetH)
+  };
 
-input group "=== Market Sessions (broker/server time) ==="
+enum ENUM_DAY_TZ
+  {
+   DAYTZ_NEW_YORK   = 0,    // exchange day of the TradingView symbol (assumed New York)
+   DAYTZ_UTC        = 1,
+   DAYTZ_UTC_PLUS_2 = 2,
+   DAYTZ_SERVER     = 3
+  };
+
+enum ENUM_LOT_ROUND
+  {
+   LOT_NEAREST = 0,         // risk stays equal on average (closest to Pine's continuous qty)
+   LOT_FLOOR   = 1          // never risk more than the ladder
+  };
+
+//======================================================================
+// INPUTS (names / defaults mirror the Pine inputs)
+//======================================================================
+input group "=== Server clock ==="
+input ENUM_SRV_CLOCK ServerClockMode = SRV_NYCLOSE_USDST;
+input int            ServerFixedUtcOffsetH = 2;           // only for SRV_FIXED
+input ENUM_DAY_TZ    PineDayTz = DAYTZ_NEW_YORK;          // day used by "max trades per day"
+
+input group "=== Market Sessions (Pine clock = fixed UTC+2) ==="
 input int    AsiaOpenHour     = 0;
 input int    AsiaCloseHour    = 8;
 input int    LondonOpenHour   = 9;
@@ -57,46 +74,58 @@ input int    LondonCloseHour  = 11;
 input int    NYOpenHour       = 14;
 input int    NYCloseHour      = 16;
 input int    NYCloseMinute    = 30;
-// If your broker's server time isn't UTC+2 (what the Pine version assumed,
-// matching typical FXCM/OANDA chart time), set the real offset here so the
-// session windows above land on the same real-world hours. E.g. if your
-// server is UTC+3, set ServerUtcOffsetHours = 3 - 2 = 1.
-input int    ServerUtcOffsetHours = 0;
 
 input group "=== Liquidity Levels ==="
 input bool   UsePDHL       = true;
 input bool   UsePWHL       = true;
 input bool   UseEQL        = true;
-input int    LiqPenPoints  = 1;       // points beyond a level to count as swept (0 = touch counts)
-input double SweepBuffer   = 0.0;        // SL padding beyond the sweep wick
+input int    LiqPenTicks   = 1;        // ticks beyond a level to count as swept (0 = a touch counts)
+input double SweepBuffer   = 0.0;      // SL padding beyond the reaction extreme
+input bool   ScaleThr      = false;    // scale price thresholds by tick/0.00001 (non-FX symbols)
 
 input group "=== Equal Highs / Lows ==="
 input double EqlTolerance      = 0.0005;
-input int    EqlPivotStrength  = 10;     // bars each side, like Pine's sw_len
+input int    EqlPivotStrength  = 10;               // reference-TF candles each side
 input int    EqlLookbackPivots = 5;
-input ENUM_TIMEFRAMES EqlRefTF = PERIOD_M15;
+input ENUM_TIMEFRAMES EqlRefTF = PERIOD_H1;        // H1, H4, D1, W1 or MN1
+input int    EqAgeDays         = 14;               // EQH/EQL older than this are dropped (0 = never)
+input int    EqReplayBars      = 6000;             // reference-TF bars replayed at start
+
+input group "=== HTF Imbalances ==="
+input bool   UseHtf1H      = true;
+input bool   UseHtf4H      = true;
+input bool   UseHtfD       = true;
+input bool   UseHtfW       = true;
+input bool   UseHtfM       = false;
+input double HtfFvgMin     = 0.0003;   // min gap size
+input bool   UseHtfImbEntry = true;    // an imbalance touch arms the cycle
+input bool   UseHtfFilter  = false;    // require an active HTF imbalance on the trade side
+input double MergeTol      = 0.0005;   // stack link tolerance (outermost-gap logic)
+input int    Age1HDays     = 14;
+input int    Age4HDays     = 45;
 
 input group "=== Structure (CE) ==="
-input double CeLegPct      = 25.0; // CE: min pullback, % of the final leg that followed it
-input double CeDispAtr     = 0.75; // CE: a displacement candle (body >= this x ATR) that made the extreme may use its own wick
-input int    CeContBars    = 8;    // CE: a swing is "established" once this many candles old ...
-input double CeContAtr     = 2.0;  // ... and separated from now by a pullback of this many ATR (wick beyond it = retest, annulled)
-input double CeLegCapAtr   = 1.25; // CE: the %-of-leg part of the pullback threshold never exceeds this many ATR
-input int    CePivBars     = 5;    // CE: displacement candle -> last swing within this many candles before it is the base
-input int    CeRunBars     = 3;    // CE: displacement candle ending a run of >= this many same-direction candles -> origin of the run
-input double CeMinAtr      = 1.0;  // CE: min pullback, x ATR(14) of M1 (Wilder, like Pine ta.atr)
-input int    CeScanBars    = 60;   // CE: how far back from the extreme the leg start is searched
-input int    MssMaxBars    = 150;  // whole-cycle deadline (sweep -> break -> session), in M1 bars
+input double CeLegPct      = 25.0;
+input double CeDispAtr     = 0.75;
+input int    CeContBars    = 8;
+input double CeContAtr     = 2.0;
+input double CeLegCapAtr   = 1.25;
+input int    CePivBars     = 5;
+input int    CeRunBars     = 3;
+input double CeMinAtr      = 1.0;
+input int    CeScanBars    = 60;
+input int    MssMaxBars    = 150;      // whole-cycle deadline after the sweep, in M1 bars
 
 input group "=== Risk Management ==="
 input double RRRatio        = 2.0;
 input double MaxSL          = 0.0050;
 input double MinSL          = 0.0003;
 input bool   CapSLToMax     = true;
-input bool   SecondChance   = true;   // after a stop-out, re-arm the same setup once (same session)
+input bool   SecondChance   = true;
 input int    MaxTradesPerDay     = 4;
 input int    MaxTradesPerSession = 2;   // London and NY each, independently
 input double FixedCapital   = 100000;   // non-compounded risk base
+input ENUM_LOT_ROUND LotRounding = LOT_NEAREST;
 
 input group "=== Tiered Risk (% of FixedCapital, one step per loss) ==="
 input double Risk1 = 1.00;
@@ -108,70 +137,265 @@ input double Risk6 = 1.55;
 
 input group "=== Misc ==="
 input ulong  MagicNumber = 20260902;
+input bool   LogParity   = false;       // print EVT| lines to diff against TradingView
 
 //======================================================================
-// STATE (persists across ticks, mirrors Pine's `var`)
+// SMALL TYPES
 //======================================================================
+struct M1Bar { double o,h,l,c; datetime t; };
 
-// 0 = IDLE | 1 = BEAR_SWEPT (hunting bearish CE) | 2 = BULL_SWEPT (hunting bullish CE)
-// 3 = PENDING SHORT (CE broken, waiting for session) | 4 = PENDING LONG
+// One side (bear or bull) of an imbalance list: near edge, far edge, origin
+// (open of the middle candle), creation (close of the 3rd candle).
+struct GapSide
+  {
+   double   nr[];
+   double   fr[];
+   datetime org[];
+   datetime cre[];
+  };
+
+// Equal-high / equal-low list: price, pivot candle open, creation.
+struct LvList
+  {
+   double   px[];
+   datetime org[];
+   datetime cre[];
+  };
+
+struct HtfTf
+  {
+   ENUM_TIMEFRAMES tf;
+   bool     use;
+   int      cap;
+   int      ageDays;
+   long     legSec;
+   GapSide  cB;      // context (higher-timeframe) lists
+   GapSide  cU;
+   GapSide  B;       // chart lists (consumed at M1 resolution)
+   GapSide  U;
+   datetime up;      // import watermark (creation time of the newest imported zone)
+   datetime fedOpen; // open of the last HTF bar fed to the context
+   MqlRates m1;      // the candle before the one being fed  (Pine [1])
+   MqlRates m2;      // two candles before                    (Pine [2])
+   int      nFed;
+   bool     tB;      // a bearish (supply) imbalance was liquidated this bar
+   bool     tU;
+  };
+
+//======================================================================
+// STATE (persists across bars, mirrors Pine's `var`)
+//======================================================================
+// 0 = IDLE | 1 = BEAR_SWEPT (hunting bearish CE) | 2 = BULL_SWEPT
+// 3 = PENDING SHORT (CE broken) | 4 = PENDING LONG
 int      state          = 0;
-datetime sweepBarTime    = 0;
-datetime mssBarTime      = 0;
-
-// The session the CURRENT cycle armed in, captured once at the sweep. Used
-// to abandon the cycle the instant that specific session ends instead of
-// letting it wait across the gap into the next one.
+long     g_barIdx       = 0;      // Pine bar_index (counts processed M1 bars)
+long     sweepBarIdx    = 0;
 bool     cycSessAsia = false, cycSessLondon = false, cycSessNy = false;
 
-double   sweepHi = 0, sweepLo = 0;           // wick extreme since the sweep (stop anchor)
-double   mssRefBear = 0, mssRefBull = 0;     // the CE level itself
-datetime mssRefBarTime = 0;                  // which M1 bar the CE level currently sits on
-double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from (deepest wick of the swing)
-datetime ceExtHiT = 0, ceExtLoT = 0;         // candle that printed it
-double   atrM1 = 0; int atrCount = 0; double trSum = 0;  // Wilder ATR(14) on M1
-double   activeSweepPx = 0;
-double   cycSweepPx    = 0;      // zone of the last entry (for its second chance)
+double   sweepHi = 0, sweepLo = 0;           // reaction extreme (stop anchor)
+double   mssRefBear = 0, mssRefBull = 0;     // the CE level
+datetime mssRefBarTime = 0;                  // M1 bar the CE level sits on
+double   ceExtHi = 0, ceExtLo = 0;           // extreme the CE is measured from
+datetime ceExtHiT = 0, ceExtLoT = 0;
 bool     chanceUsed    = true;
-bool     slJustHit     = false;  // the last closed deal (seen this bar) was a loss
+bool     slJustHit     = false;              // a trade closed at a loss on this bar
 bool     slWasShort    = false;
+datetime lastClosedEntryTime = 0;            // entry time of that trade
+
+double   atrM1 = 0;       // Wilder ATR(14) of M1
+int      atrCount = 0;
+double   trSum = 0;
+double   g_prevClose = 0;
+bool     g_havePrevClose = false;
 
 int      attempt = 1;
-
-int      lastDay = -1;
 int      tradesToday = 0;
+long     lastDayKey = -1;
 int      lonSessionTrades = 0;
 int      nySessionTrades = 0;
-
 bool     prevInLondon = false;
 bool     prevInNy = false;
 
-// Structural levels + their "already swept this period" flags, mirroring
-// pdh_swept / pwh_swept / eqh_swept in the Pine version.
-double   pdh = 0, pdl = 0;           bool pdhSwept = false, pdlSwept = false;
-double   pwh = 0, pwl = 0;           bool pwhSwept = false, pwlSwept = false;
-double   lastEqh = 0, lastEql = 0;   bool eqhSwept = false, eqlSwept = false;
-bool     haveEqh = false, haveEql = false;
+// derived constants
+double   g_tick = 0.00001;
+double   g_pen = 0;
+double   g_thr = 1.0;
+double   g_sweepBuf = 0, g_maxSL = 0, g_minSL = 0, g_eqlTol = 0, g_htfFvgMin = 0, g_mergeTol = 0;
 
+// levels
+double   pdh = 0, pdl = 0, pwh = 0, pwl = 0;
+bool     havePd = false, havePw = false;
+datetime g_pdOpen = 0, g_pwOpen = 0;
+datetime pdSince = 0, pwSince = 0;
+bool     pdhSwept = false, pdlSwept = false, pwhSwept = false, pwlSwept = false;
 
-// Equal-highs/lows pivot history (price only; that's all Pine's swh_hist/
-// swl_hist tracked too).
-double   swhHist[];
-double   swlHist[];
+// HTF imbalances
+HtfTf    g_h[5];
 
-datetime lastSeenFormingBar = 0;  // shift-0 (still forming) M1 bar's open time
-datetime lastProcessedM1Bar = 0;  // shift-1 (last CLOSED) M1 bar we've already run
+// EQH / EQL
+ENUM_TIMEFRAMES g_eqTf = PERIOD_H1;
+LvList   g_cxH, g_cxL;       // context lists
+LvList   g_chH, g_chL;       // chart lists
+double   g_swH[];             // last confirmed pivot highs
+double   g_swL[];             // last confirmed pivot lows
+MqlRates g_ring[];           // last 2*sw+1 reference candles (chronological)
+datetime g_eqFedOpen = 0;
+datetime g_upEQ = 0;
+
+// trades bookkeeping
+bool     g_prevHasPos = false;
+bool     g_needPoll   = false;
+int      g_expectClose = 0;   // orders sent whose closing deal has not been seen yet
+int      g_dealScan   = 0;
+
+bool     g_inited = false;
+datetime lastSeenFormingBar = 0;
+datetime lastProcessedM1Bar = 0;
 
 //======================================================================
-// UTILITIES
+// LOG
 //======================================================================
+void Ev(const string s)
+  {
+   if(LogParity) Print("EVT|", s);
+  }
 
-// Fetch M1 candle data as a time series (shift 0 = most recently CLOSED M1
-// bar being processed this cycle, shift 1 = the one before it, ...),
-// matching the way the Pine version reads close/close[1]/close[2].
-struct M1Bar { double o,h,l,c; datetime t; };
+//======================================================================
+// CALENDAR / TIME MODEL
+//======================================================================
+datetime MkDate(const int y, const int m, const int d, const int hh, const int mm)
+  {
+   MqlDateTime s;
+   s.year = y; s.mon = m; s.day = d; s.hour = hh; s.min = mm; s.sec = 0;
+   s.day_of_week = 0; s.day_of_year = 0;
+   return StructToTime(s);
+  }
 
-bool GetM1(int shift, M1Bar &out)
+// day-of-month of the n-th Sunday of a month
+int NthSundayDay(const int y, const int m, const int n)
+  {
+   MqlDateTime s;
+   TimeToStruct(MkDate(y, m, 1, 0, 0), s);
+   int first = 1 + ((7 - s.day_of_week) % 7);
+   return first + 7 * (n - 1);
+  }
+
+int LastSundayDay(const int y, const int m)
+  {
+   int ny = y, nm = m + 1;
+   if(nm > 12) { nm = 1; ny++; }
+   datetime last = MkDate(ny, nm, 1, 0, 0) - 86400;
+   MqlDateTime s;
+   TimeToStruct(last, s);
+   return s.day - s.day_of_week;
+  }
+
+// New York local clock -> are we in US daylight time?
+bool UsDstLocal(const datetime nyLocal)
+  {
+   MqlDateTime s;
+   TimeToStruct(nyLocal, s);
+   datetime st = MkDate(s.year, 3, NthSundayDay(s.year, 3, 2), 3, 0);
+   datetime en = MkDate(s.year, 11, NthSundayDay(s.year, 11, 1), 2, 0);
+   return (nyLocal >= st && nyLocal < en);
+  }
+
+datetime ServerToUtc(const datetime ts)
+  {
+   if(ServerClockMode == SRV_FIXED)
+      return ts - ServerFixedUtcOffsetH * 3600;
+   if(ServerClockMode == SRV_NYCLOSE_USDST)
+     {
+      datetime ny = ts - 7 * 3600;
+      return ny + (UsDstLocal(ny) ? 4 : 5) * 3600;
+     }
+   MqlDateTime s;
+   TimeToStruct(ts, s);
+   datetime st = MkDate(s.year, 3, LastSundayDay(s.year, 3), 3, 0);
+   datetime en = MkDate(s.year, 10, LastSundayDay(s.year, 10), 4, 0);
+   bool dst = (ts >= st && ts < en);
+   return ts - (dst ? 3 : 2) * 3600;
+  }
+
+// The clock Pine's session logic uses: UTC+2, fixed all year.
+datetime PineT(const datetime ts)
+  {
+   return ServerToUtc(ts) + 2 * 3600;
+  }
+
+// New York local time from UTC (exact US DST instants)
+datetime UtcToNy(const datetime utc)
+  {
+   MqlDateTime s;
+   TimeToStruct(utc, s);
+   datetime st = MkDate(s.year, 3, NthSundayDay(s.year, 3, 2), 7, 0);   // 02:00 EST = 07:00 UTC
+   datetime en = MkDate(s.year, 11, NthSundayDay(s.year, 11, 1), 6, 0); // 02:00 EDT = 06:00 UTC
+   bool dst = (utc >= st && utc < en);
+   return utc - (dst ? 4 : 5) * 3600;
+  }
+
+long DateKey(const datetime t)
+  {
+   MqlDateTime s;
+   TimeToStruct(t, s);
+   return (long)s.year * 10000 + s.mon * 100 + s.day;
+  }
+
+long DayKeyOf(const datetime ts)
+  {
+   if(PineDayTz == DAYTZ_SERVER)     return DateKey(ts);
+   datetime utc = ServerToUtc(ts);
+   if(PineDayTz == DAYTZ_UTC)        return DateKey(utc);
+   if(PineDayTz == DAYTZ_UTC_PLUS_2) return DateKey(utc + 2 * 3600);
+   return DateKey(UtcToNy(utc));
+  }
+
+bool InLondonP(const int hh)
+  {
+   return hh >= LondonOpenHour && hh < LondonCloseHour;
+  }
+
+bool InNyP(const int hh, const int mm)
+  {
+   bool closed = (hh > NYCloseHour) || (hh == NYCloseHour && mm >= NYCloseMinute);
+   return hh >= NYOpenHour && !closed;
+  }
+
+bool InAsiaP(const int hh)
+  {
+   if(AsiaOpenHour <= AsiaCloseHour) return hh >= AsiaOpenHour && hh < AsiaCloseHour;
+   return hh >= AsiaOpenHour || hh < AsiaCloseHour;
+  }
+
+// Port of Pine f_sess_key: FX-day stamp * 10 + bucket (1 Asia, 3 London, 5 NY);
+// the time between sessions belongs to the NEXT session.
+long SessKey(const datetime ts)
+  {
+   datetime p = PineT(ts);
+   MqlDateTime s;
+   TimeToStruct(p, s);
+   int hh = s.hour;
+   int mins = hh * 60 + s.min;
+   long d = (long)s.year * 10000 + s.mon * 100 + s.day;
+   int b;
+   if(InAsiaP(hh))                                     b = 1;
+   else if(mins < LondonCloseHour * 60)                b = 3;
+   else if(mins < NYCloseHour * 60 + NYCloseMinute)    b = 5;
+   else                                                b = 6;
+   if(b == 6)
+     {
+      MqlDateTime s2;
+      TimeToStruct(p + 86400, s2);
+      d = (long)s2.year * 10000 + s2.mon * 100 + s2.day;
+      b = 1;
+     }
+   return d * 10 + b;
+  }
+
+//======================================================================
+// M1 ACCESS + ATR
+//======================================================================
+bool GetM1(const int shift, M1Bar &out)
   {
    MqlRates r[];
    ArraySetAsSeries(r, true);
@@ -180,144 +404,553 @@ bool GetM1(int shift, M1Bar &out)
    return true;
   }
 
-int HourOf(datetime t)  { MqlDateTime s; TimeToStruct(t, s); int h = s.hour + ServerUtcOffsetHours; if(h<0) h+=24; if(h>=24) h-=24; return h; }
-int MinuteOf(datetime t){ MqlDateTime s; TimeToStruct(t, s); return s.min; }
-int DayOf(datetime t)   { MqlDateTime s; TimeToStruct(t, s); return s.year*10000 + s.mon*100 + s.day; }
-
-bool InLondon(datetime t)
+// Wilder ATR(14), exactly Pine ta.atr: first TR = high-low, SMA seed over the
+// first 14 TRs, then RMA.
+void AtrStep(const double h, const double l, const double c)
   {
-   int h = HourOf(t);
-   return h >= LondonOpenHour && h < LondonCloseHour;
-  }
-
-bool InNy(datetime t)
-  {
-   int h = HourOf(t), m = MinuteOf(t);
-   bool closed = (h > NYCloseHour) || (h == NYCloseHour && m >= NYCloseMinute);
-   return h >= NYOpenHour && !closed;
-  }
-
-bool InAsia(datetime t)
-  {
-   int h = HourOf(t);
-   if(AsiaOpenHour <= AsiaCloseHour) return h >= AsiaOpenHour && h < AsiaCloseHour;
-   return h >= AsiaOpenHour || h < AsiaCloseHour; // wraps past midnight
+   double tr = h - l;
+   if(g_havePrevClose)
+      tr = MathMax(tr, MathMax(MathAbs(h - g_prevClose), MathAbs(l - g_prevClose)));
+   if(atrCount < 14) { trSum += tr; atrCount++; atrM1 = trSum / atrCount; }
+   else atrM1 = (atrM1 * 13.0 + tr) / 14.0;
+   g_prevClose = c;
+   g_havePrevClose = true;
   }
 
 //======================================================================
-// STRUCTURAL LEVELS: PDH/PDL, PWH/PWL, EQH/EQL
+// LIST HELPERS
 //======================================================================
+int GsN(const GapSide &g) { return ArraySize(g.nr); }
 
-void UpdatePdhPdl()
+void GsRemove(GapSide &g, const int idx)
   {
-   // Previous COMPLETED daily bar's high/low. Reset the "swept" flag once
-   // per new day (like Pine's is_new_day gate).
-   static int lastPdhDay = -1;
-   MqlDateTime s; TimeToStruct(TimeCurrent(), s);
-   int today = s.year*10000 + s.mon*100 + s.day;
-   if(today != lastPdhDay)
+   int n = ArraySize(g.nr);
+   if(idx < 0 || idx >= n) return;
+   for(int i = idx; i < n - 1; i++)
      {
-      lastPdhDay = today;
-      pdh = iHigh(_Symbol, PERIOD_D1, 1);
-      pdl = iLow(_Symbol, PERIOD_D1, 1);
-      pdhSwept = false; pdlSwept = false;
+      g.nr[i] = g.nr[i + 1];
+      g.fr[i] = g.fr[i + 1];
+      g.org[i] = g.org[i + 1];
+      g.cre[i] = g.cre[i + 1];
+     }
+   ArrayResize(g.nr, n - 1);
+   ArrayResize(g.fr, n - 1);
+   ArrayResize(g.org, n - 1);
+   ArrayResize(g.cre, n - 1);
+  }
+
+void GsPush(GapSide &g, const double n_, const double f_, const datetime o_, const datetime c_, const int cap)
+  {
+   int k = ArraySize(g.nr);
+   ArrayResize(g.nr, k + 1);
+   ArrayResize(g.fr, k + 1);
+   ArrayResize(g.org, k + 1);
+   ArrayResize(g.cre, k + 1);
+   g.nr[k] = n_; g.fr[k] = f_; g.org[k] = o_; g.cre[k] = c_;
+   if(k + 1 > cap) GsRemove(g, 0);
+  }
+
+void GsClear(GapSide &g)
+  {
+   ArrayResize(g.nr, 0);
+   ArrayResize(g.fr, 0);
+   ArrayResize(g.org, 0);
+   ArrayResize(g.cre, 0);
+  }
+
+int LlN(const LvList &l) { return ArraySize(l.px); }
+
+void LlRemove(LvList &l, const int idx)
+  {
+   int n = ArraySize(l.px);
+   if(idx < 0 || idx >= n) return;
+   for(int i = idx; i < n - 1; i++)
+     {
+      l.px[i] = l.px[i + 1];
+      l.org[i] = l.org[i + 1];
+      l.cre[i] = l.cre[i + 1];
+     }
+   ArrayResize(l.px, n - 1);
+   ArrayResize(l.org, n - 1);
+   ArrayResize(l.cre, n - 1);
+  }
+
+void LlPush(LvList &l, const double p_, const datetime o_, const datetime c_, const int cap)
+  {
+   int k = ArraySize(l.px);
+   ArrayResize(l.px, k + 1);
+   ArrayResize(l.org, k + 1);
+   ArrayResize(l.cre, k + 1);
+   l.px[k] = p_; l.org[k] = o_; l.cre[k] = c_;
+   if(k + 1 > cap) LlRemove(l, 0);
+  }
+
+void LlClear(LvList &l)
+  {
+   ArrayResize(l.px, 0);
+   ArrayResize(l.org, 0);
+   ArrayResize(l.cre, 0);
+  }
+
+// Nominal close of a higher-timeframe candle opened at `open`.
+datetime HtfClose(const ENUM_TIMEFRAMES tf, const datetime open)
+  {
+   if(tf == PERIOD_MN1)
+     {
+      MqlDateTime s;
+      TimeToStruct(open, s);
+      int y = s.year, m = s.mon + 1;
+      if(m > 12) { m = 1; y++; }
+      return MkDate(y, m, 1, 0, 0);
+     }
+   if(tf == PERIOD_W1) return open + 7 * 86400;
+   return open + PeriodSeconds(tf);
+  }
+
+// Pine f_age_ok: a zone older than `days` is gone (0 = never).
+bool AgeOk(const datetime org, const int days, const datetime nowT)
+  {
+   if(days <= 0 || org == 0) return true;
+   return (nowT - org) <= (long)days * 86400;
+  }
+
+//======================================================================
+// HTF IMBALANCES  (Pine f_ctx_gaps / f_ctx_import / f_expire / f_gap_cross)
+//======================================================================
+// Feed ONE closed higher-timeframe candle into the context lists.
+void HtfCtxFeedBar(HtfTf &h, const MqlRates &c3)
+  {
+   datetime c3Close = HtfClose(h.tf, c3.time);
+   // gaps touched by this candle (that existed before it) are gone
+   for(int i = GsN(h.cB) - 1; i >= 0; i--)
+      if(c3.time >= h.cB.cre[i] && c3.high >= h.cB.nr[i] + g_pen) GsRemove(h.cB, i);
+   for(int i = GsN(h.cU) - 1; i >= 0; i--)
+      if(c3.time >= h.cU.cre[i] && c3.low <= h.cU.nr[i] - g_pen) GsRemove(h.cU, i);
+   // 3-candle rule: candle 1 = m2, middle = m1, candle 3 = c3
+   if(h.nFed >= 2)
+     {
+      if(h.m2.low > c3.high && (h.m2.low - c3.high) >= g_htfFvgMin)
+         GsPush(h.cB, c3.high, h.m2.low, h.m1.time, c3Close, h.cap);
+      if(h.m2.high < c3.low && (c3.low - h.m2.high) >= g_htfFvgMin)
+         GsPush(h.cU, c3.low, h.m2.high, h.m1.time, c3Close, h.cap);
+     }
+   h.m2 = h.m1;
+   h.m1 = c3;
+   h.nFed++;
+  }
+
+// Deliver every candle of tf whose close is <= the end of the processed
+// minute (Pine imports a zone when cre <= time_close of the chart bar), in
+// chronological order. A candle closed over a weekend is delivered on the
+// first bar that can see it.
+void HtfDeliver(HtfTf &h, const datetime tB)
+  {
+   datetime ot1 = iTime(_Symbol, h.tf, 1);          // newest COMPLETED candle (0 = forming)
+   if(ot1 == 0 || ot1 <= h.fedOpen) return;
+   datetime lim = tB + 60;
+   int first = 1;
+   while(first < 400)
+     {
+      datetime o = iTime(_Symbol, h.tf, first);
+      if(o == 0 || o <= h.fedOpen) return;
+      if(HtfClose(h.tf, o) <= lim) break;
+      first++;
+     }
+   int newN = 0;
+   while(newN < 400)
+     {
+      datetime o = iTime(_Symbol, h.tf, first + newN);
+      if(o == 0 || o <= h.fedOpen) break;
+      newN++;
+     }
+   if(newN == 0) return;
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   if(CopyRates(_Symbol, h.tf, first, newN, r) != newN) return;
+   bool asc = (r[0].time <= r[newN - 1].time);
+   for(int k = 0; k < newN; k++)
+     {
+      int idx = asc ? k : (newN - 1 - k);
+      if(r[idx].time <= h.fedOpen) continue;
+      HtfCtxFeedBar(h, r[idx]);
+      h.fedOpen = r[idx].time;
      }
   }
 
-void UpdatePwhPwl()
+// Import zones that came into existence after `up` (their 3rd candle closed).
+void HtfImport(HtfTf &h, const datetime tB)
   {
-   static int lastPwhWeek = -1;
-   MqlDateTime s; TimeToStruct(TimeCurrent(), s);
-   // ISO-ish week id: year*100 + week-of-year approximation via day_of_year/7
-   int weekId = s.year*100 + (s.day_of_year/7);
-   if(weekId != lastPwhWeek)
+   datetime lim = tB + 60;
+   datetime mxB = h.up, mxU = h.up;
+   for(int i = 0; i < GsN(h.cB); i++)
      {
-      lastPwhWeek = weekId;
-      pwh = iHigh(_Symbol, PERIOD_W1, 1);
-      pwl = iLow(_Symbol, PERIOD_W1, 1);
-      pwhSwept = false; pwlSwept = false;
+      datetime c = h.cB.cre[i];
+      if(c > h.up && c <= lim)
+        {
+         GsPush(h.B, h.cB.nr[i], h.cB.fr[i], h.cB.org[i], c, h.cap);
+         if(c > mxB) mxB = c;
+        }
+     }
+   for(int i = 0; i < GsN(h.cU); i++)
+     {
+      datetime c = h.cU.cre[i];
+      if(c > h.up && c <= lim)
+        {
+         GsPush(h.U, h.cU.nr[i], h.cU.fr[i], h.cU.org[i], c, h.cap);
+         if(c > mxU) mxU = c;
+        }
+     }
+   h.up = (mxB > mxU) ? mxB : mxU;
+  }
+
+// Oldest zones past their age limit are removed (org ascends with creation).
+void GsExpire(GapSide &g, const int days, const datetime nowT)
+  {
+   if(days <= 0) return;
+   while(GsN(g) > 0 && !AgeOk(g.org[0], days, nowT))
+      GsRemove(g, 0);
+  }
+
+// Pine f_recompute_outer: a gap is "outer" when it is not linked to the gap
+// before it in the farthest-from-price-first order.
+void RecomputeOuter(const GapSide &g, const bool isSupply, const long legSec, bool &outer[])
+  {
+   int n = GsN(g);
+   ArrayResize(outer, n);
+   if(n == 0) return;
+   int idx[];
+   ArrayResize(idx, n);
+   for(int i = 0; i < n; i++) idx[i] = i;
+   // stable insertion sort by near edge: supply descending, demand ascending
+   for(int a = 1; a < n; a++)
+     {
+      int key = idx[a];
+      double kv = g.nr[key];
+      int b = a - 1;
+      while(b >= 0 && (isSupply ? (g.nr[idx[b]] < kv) : (g.nr[idx[b]] > kv)))
+        {
+         idx[b + 1] = idx[b];
+         b--;
+        }
+      idx[b + 1] = key;
+     }
+   double   curNear = 0;
+   datetime curOrg = 0;
+   bool     have = false;
+   for(int k = 0; k < n; k++)
+     {
+      int i = idx[k];
+      double e = g.nr[i];
+      double f = g.fr[i];
+      datetime o = g.org[i];
+      bool out = true;
+      if(have)
+        {
+         bool linked = (isSupply ? (curNear <= f + g_mergeTol) : (curNear >= f - g_mergeTol))
+                       || (MathAbs((double)(curOrg - o)) <= (double)legSec);
+         out = !linked;
+        }
+      outer[i] = out;
+      curNear = e;
+      curOrg = o;
+      have = true;
      }
   }
 
-
-// Equal highs/lows: simple pivot-high/pivot-low check on EqlRefTF, grouped
-// by EqlTolerance, mirroring the Pine version's swh_hist/swl_hist logic.
-bool IsPivotHigh(int shift, double &val)
+// Pine f_gap_cross: every gap price traded beyond (after it existed) is
+// removed; only a hit on an OUTER gap counts as a liquidation.
+bool HtfCross(GapSide &g, const bool isSupply, const long legSec, const datetime bt, const double H, const double L)
   {
-   double h = iHigh(_Symbol, EqlRefTF, shift);
-   for(int i=1;i<=EqlPivotStrength;i++)
+   int n = GsN(g);
+   if(n == 0) return false;
+   bool hit[];
+   ArrayResize(hit, n);
+   bool any = false;
+   for(int i = 0; i < n; i++)
      {
-      if(iHigh(_Symbol, EqlRefTF, shift-i) >= h) return false;
-      if(iHigh(_Symbol, EqlRefTF, shift+i) >= h) return false;
+      hit[i] = (bt >= g.cre[i]) && (isSupply ? (H >= g.nr[i] + g_pen) : (L <= g.nr[i] - g_pen));
+      if(hit[i]) any = true;
      }
-   val = h;
-   return true;
+   if(!any) return false;
+   bool outer[];
+   RecomputeOuter(g, isSupply, legSec, outer);
+   bool touch = false;
+   for(int i = 0; i < n; i++)
+      if(hit[i] && outer[i]) touch = true;
+   for(int i = n - 1; i >= 0; i--)
+      if(hit[i]) GsRemove(g, i);
+   return touch;
   }
-bool IsPivotLow(int shift, double &val)
+
+void HtfStep(HtfTf &h, const datetime tB, const double H, const double L)
   {
-   double l = iLow(_Symbol, EqlRefTF, shift);
-   for(int i=1;i<=EqlPivotStrength;i++)
-     {
-      if(iLow(_Symbol, EqlRefTF, shift-i) <= l) return false;
-      if(iLow(_Symbol, EqlRefTF, shift+i) <= l) return false;
-     }
-   val = l;
-   return true;
+   h.tB = false;
+   h.tU = false;
+   if(!h.use) return;
+   HtfDeliver(h, tB);
+   HtfImport(h, tB);
+   datetime nowT = tB + 60;
+   GsExpire(h.B, h.ageDays, nowT);
+   GsExpire(h.U, h.ageDays, nowT);
+   h.tB = HtfCross(h.B, true,  h.legSec, tB, H, L);
+   h.tU = HtfCross(h.U, false, h.legSec, tB, H, L);
   }
 
-void UpdateEqlOnNewRefBar()
+// Rebuild the context from history before the first processed bar.
+void HtfReplay(HtfTf &h, const datetime tB)
   {
-   if(!UseEQL) return;
-   static datetime lastRefBar = 0;
-   datetime refT = iTime(_Symbol, EqlRefTF, 0);
-   if(refT == lastRefBar) return;
-   lastRefBar = refT;
-
-   double v;
-   if(IsPivotHigh(EqlPivotStrength, v))
+   if(!h.use) return;
+   datetime lim = tB + 60;
+   datetime from;
+   if(h.tf == PERIOD_H1)       from = tB - (long)(Age1HDays + 30) * 86400;
+   else if(h.tf == PERIOD_H4)  from = tB - (long)(Age4HDays + 60) * 86400;
+   else if(h.tf == PERIOD_D1)  from = tB - (long)900 * 86400;
+   else if(h.tf == PERIOD_W1)  from = tB - (long)300 * 7 * 86400;
+   else                        from = tB - (long)120 * 31 * 86400;
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int got = CopyRates(_Symbol, h.tf, from, lim, r);
+   if(got <= 0) return;
+   bool asc = (r[0].time <= r[got - 1].time);
+   for(int k = 0; k < got; k++)
      {
-      for(int i=0;i<ArraySize(swhHist);i++)
-         if(MathAbs(v - swhHist[i]) <= EqlTolerance) { lastEqh = v; haveEqh = true; eqhSwept = false; break; }
-      int n = ArraySize(swhHist);
-      if(n >= EqlLookbackPivots) { for(int i=0;i<n-1;i++) swhHist[i]=swhHist[i+1]; ArrayResize(swhHist, n-1); }
-      ArrayResize(swhHist, ArraySize(swhHist)+1);
-      swhHist[ArraySize(swhHist)-1] = v;
-     }
-   if(IsPivotLow(EqlPivotStrength, v))
-     {
-      for(int i=0;i<ArraySize(swlHist);i++)
-         if(MathAbs(v - swlHist[i]) <= EqlTolerance) { lastEql = v; haveEql = true; eqlSwept = false; break; }
-      int n = ArraySize(swlHist);
-      if(n >= EqlLookbackPivots) { for(int i=0;i<n-1;i++) swlHist[i]=swlHist[i+1]; ArrayResize(swlHist, n-1); }
-      ArrayResize(swlHist, ArraySize(swlHist)+1);
-      swlHist[ArraySize(swlHist)-1] = v;
+      int idx = asc ? k : (got - 1 - k);
+      if(HtfClose(h.tf, r[idx].time) > lim) continue;
+      HtfCtxFeedBar(h, r[idx]);
+      h.fedOpen = r[idx].time;
      }
   }
 
 //======================================================================
-// CE REFERENCE — mirrors Pine's f_ce_ref exactly.
+// EQH / EQL  (Pine f_ctx_eq / f_eq_import / f_eqh_cross)
 //======================================================================
-// Walking back from the extreme (shift eShift; 1 = the bar being processed),
-// the running low (short setup) / high (long setup) is the candidate; it
-// becomes the CE as soon as an older candle stands far enough beyond it:
-//   pullback >= max(CeLegPct % of the leg that followed, CeMinAtr x ATR14).
+void SwPush(double &arr[], const double v)
+  {
+   int n = ArraySize(arr);
+   if(n >= EqlLookbackPivots)
+     {
+      for(int i = 0; i < n - 1; i++) arr[i] = arr[i + 1];
+      ArrayResize(arr, n - 1);
+      n = n - 1;
+     }
+   ArrayResize(arr, n + 1);
+   arr[n] = v;
+  }
+
+// A confirmed pivot of the reference timeframe: equal to a recent pivot
+// within EqlTolerance -> it becomes a live equal level (deduplicated).
+void EqPivot(LvList &ctx, double &sw[], const double v, const datetime org, const datetime cre)
+  {
+   int sz = ArraySize(sw);
+   for(int j = 0; j < sz; j++)
+     {
+      if(MathAbs(v - sw[j]) <= g_eqlTol)
+        {
+         bool dup = false;
+         for(int q = 0; q < LlN(ctx); q++)
+            if(MathAbs(v - ctx.px[q]) <= g_eqlTol) dup = true;
+         if(!dup) LlPush(ctx, v, org, cre, 100);
+         break;
+        }
+     }
+   SwPush(sw, v);
+  }
+
+void EqFeedBar(const MqlRates &c)
+  {
+   datetime cre = HtfClose(g_eqTf, c.time);
+   // levels touched by this candle (that existed before it) are gone
+   for(int i = LlN(g_cxH) - 1; i >= 0; i--)
+      if(c.time >= g_cxH.cre[i] && c.high >= g_cxH.px[i] + g_pen) LlRemove(g_cxH, i);
+   for(int i = LlN(g_cxL) - 1; i >= 0; i--)
+      if(c.time >= g_cxL.cre[i] && c.low <= g_cxL.px[i] - g_pen) LlRemove(g_cxL, i);
+   // ring of the last 2*sw+1 candles
+   int need = 2 * EqlPivotStrength + 1;
+   int n = ArraySize(g_ring);
+   if(n >= need)
+     {
+      for(int i = 0; i < n - 1; i++) g_ring[i] = g_ring[i + 1];
+      ArrayResize(g_ring, n - 1);
+      n = n - 1;
+     }
+   ArrayResize(g_ring, n + 1);
+   g_ring[n] = c;
+   n = n + 1;
+   if(n >= need)
+     {
+      int cIdx = n - 1 - EqlPivotStrength;
+      double ch = g_ring[cIdx].high;
+      double cl = g_ring[cIdx].low;
+      bool okh = true, okl = true;
+      for(int k = 1; k <= EqlPivotStrength; k++)
+        {
+         if(g_ring[cIdx + k].high >= ch || g_ring[cIdx - k].high >= ch) okh = false;
+         if(g_ring[cIdx + k].low  <= cl || g_ring[cIdx - k].low  <= cl) okl = false;
+        }
+      if(okh) EqPivot(g_cxH, g_swH, ch, g_ring[cIdx].time, cre);
+      if(okl) EqPivot(g_cxL, g_swL, cl, g_ring[cIdx].time, cre);
+     }
+  }
+
+void EqDeliver(const datetime tB)
+  {
+   datetime ot1 = iTime(_Symbol, g_eqTf, 1);
+   if(ot1 == 0 || ot1 <= g_eqFedOpen) return;
+   datetime lim = tB + 60;
+   int first = 1;
+   while(first < 400)
+     {
+      datetime o = iTime(_Symbol, g_eqTf, first);
+      if(o == 0 || o <= g_eqFedOpen) return;
+      if(HtfClose(g_eqTf, o) <= lim) break;
+      first++;
+     }
+   int newN = 0;
+   while(newN < 400)
+     {
+      datetime o = iTime(_Symbol, g_eqTf, first + newN);
+      if(o == 0 || o <= g_eqFedOpen) break;
+      newN++;
+     }
+   if(newN == 0) return;
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   if(CopyRates(_Symbol, g_eqTf, first, newN, r) != newN) return;
+   bool asc = (r[0].time <= r[newN - 1].time);
+   for(int k = 0; k < newN; k++)
+     {
+      int idx = asc ? k : (newN - 1 - k);
+      if(r[idx].time <= g_eqFedOpen) continue;
+      EqFeedBar(r[idx]);
+      g_eqFedOpen = r[idx].time;
+     }
+  }
+
+void EqReplay(const datetime tB)
+  {
+   datetime lim = tB + 60;
+   datetime from = tB - (long)EqReplayBars * PeriodSeconds(g_eqTf);
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int got = CopyRates(_Symbol, g_eqTf, from, lim, r);
+   if(got <= 0) return;
+   bool asc = (r[0].time <= r[got - 1].time);
+   for(int k = 0; k < got; k++)
+     {
+      int idx = asc ? k : (got - 1 - k);
+      if(HtfClose(g_eqTf, r[idx].time) > lim) continue;
+      EqFeedBar(r[idx]);
+      g_eqFedOpen = r[idx].time;
+     }
+  }
+
+void EqImport(const datetime tB)
+  {
+   datetime lim = tB + 60;
+   datetime mxH = g_upEQ, mxL = g_upEQ;
+   for(int i = 0; i < LlN(g_cxH); i++)
+     {
+      datetime c = g_cxH.cre[i];
+      if(c > g_upEQ && c <= lim)
+        {
+         LlPush(g_chH, g_cxH.px[i], g_cxH.org[i], c, 100);
+         if(c > mxH) mxH = c;
+        }
+     }
+   for(int i = 0; i < LlN(g_cxL); i++)
+     {
+      datetime c = g_cxL.cre[i];
+      if(c > g_upEQ && c <= lim)
+        {
+         LlPush(g_chL, g_cxL.px[i], g_cxL.org[i], c, 100);
+         if(c > mxL) mxL = c;
+        }
+     }
+   g_upEQ = (mxH > mxL) ? mxH : mxL;
+  }
+
+void LlExpire(LvList &l, const int days, const datetime nowT)
+  {
+   if(days <= 0) return;
+   while(LlN(l) > 0 && !AgeOk(l.org[0], days, nowT))
+      LlRemove(l, 0);
+  }
+
+// Every equal level price traded beyond (after it existed) is consumed.
+bool EqCross(LvList &l, const bool isHigh, const datetime bt, const double H, const double L)
+  {
+   bool touched = false;
+   for(int i = LlN(l) - 1; i >= 0; i--)
+     {
+      bool hit = (bt >= l.cre[i]) && (isHigh ? (H >= l.px[i] + g_pen) : (L <= l.px[i] - g_pen));
+      if(hit)
+        {
+         touched = true;
+         LlRemove(l, i);
+        }
+     }
+   return touched;
+  }
+
+//======================================================================
+// PREVIOUS DAY / WEEK  (Pine PDH/PDL/PWH/PWL)
+//======================================================================
+void LvPeriods(const datetime tB)
+  {
+   int kd = iBarShift(_Symbol, PERIOD_D1, tB, false);
+   if(kd >= 0)
+     {
+      datetime po = iTime(_Symbol, PERIOD_D1, kd + 1);
+      double   ph = iHigh(_Symbol, PERIOD_D1, kd + 1);
+      double   pl = iLow(_Symbol, PERIOD_D1, kd + 1);
+      if(po > 0 && ph > 0 && pl > 0 && po != g_pdOpen)
+        {
+         g_pdOpen = po;
+         pdh = ph; pdl = pl;
+         pdSince = po + 86400;
+         havePd = true;
+         pdhSwept = false; pdlSwept = false;
+         Ev(StringFormat("LVL|PD|%s|%.5f|%.5f", TimeToString(po), ph, pl));
+        }
+     }
+   int kw = iBarShift(_Symbol, PERIOD_W1, tB, false);
+   if(kw >= 0)
+     {
+      datetime po = iTime(_Symbol, PERIOD_W1, kw + 1);
+      double   ph = iHigh(_Symbol, PERIOD_W1, kw + 1);
+      double   pl = iLow(_Symbol, PERIOD_W1, kw + 1);
+      if(po > 0 && ph > 0 && pl > 0 && po != g_pwOpen)
+        {
+         g_pwOpen = po;
+         pwh = ph; pwl = pl;
+         pwSince = po + 7 * 86400;
+         havePw = true;
+         pwhSwept = false; pwlSwept = false;
+         Ev(StringFormat("LVL|PW|%s|%.5f|%.5f", TimeToString(po), ph, pl));
+        }
+     }
+  }
+
+bool LvHit(const bool isHigh, const double lvl, const datetime since, const datetime bt, const double H, const double L)
+  {
+   return (bt >= since) && (isHigh ? (H >= lvl + g_pen) : (L <= lvl - g_pen));
+  }
+
+//======================================================================
+// CE REFERENCE (Pine f_ce_ref / f_swing_sig)
+//======================================================================
+// Walking back from the extreme (shift eShift; 1 = the bar being processed).
 // Returns 1 = found, 0 = no pullback qualified (level = deepest point of the
 // window), -1 = no data.
-int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
+int CeRef(const bool isBear, const int eShift, double &level, datetime &lvlTime)
   {
    MqlRates r[];
    ArraySetAsSeries(r, true);
    int got = CopyRates(_Symbol, PERIOD_M1, 0, eShift + CeScanBars + 1, r);
    if(got <= eShift + 3) return -1;
    double ext = isBear ? r[eShift].high : r[eShift].low;
-   // The search starts at the candle BEFORE the extreme (its own opposite wick
-   // is part of the reversal) - except a DISPLACEMENT candle in the push
-   // direction (body >= CeDispAtr x ATR): it is the move itself, so its own
-   // opposite wick is the start of the leg.
    bool own = (isBear ? r[eShift].close > r[eShift].open : r[eShift].close < r[eShift].open)
               && MathAbs(r[eShift].close - r[eShift].open) >= CeDispAtr * atrM1;
-   // Displacement candle: its base is the last swing (3-candle fractal) right
-   // before it, even when that pause is smaller than a normal pullback.
    if(own)
      {
       int pivEnd = MathMin(eShift + CePivBars, got - 2);
@@ -333,9 +966,6 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
            }
         }
      }
-   // No single-candle swing: the extreme ends a run of consecutive push-
-   // direction candles (an impulse); its origin is the pause candle before the
-   // run, or the first candle of the run if its wick went deeper.
    if(own)
      {
       int kx = eShift + 1;
@@ -349,12 +979,9 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
          return 1;
         }
      }
-   int  mIdx = own ? eShift : eShift + 1;
-   double m   = isBear ? r[mIdx].low : r[mIdx].high;
+   int    mIdx = own ? eShift : eShift + 1;
+   double m    = isBear ? r[mIdx].low : r[mIdx].high;
    datetime mt = r[mIdx].time;
-   // A swing needs a real reaction: at least one candle in the pullback must
-   // close in its direction (bearish for the dip that forms a short's CE low,
-   // bullish for the bounce that forms a long's CE high).
    bool rev = own ? false : (isBear ? (r[mIdx].close < r[mIdx].open) : (r[mIdx].close > r[mIdx].open));
    int found = 0;
    for(int i = mIdx + 1; i < got; i++)
@@ -365,8 +992,6 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
       if(cm > 0 && cm >= thr && rev)
         {
          found = 1;
-         // The candle that closes the pullback is part of the base: its own
-         // wick counts if it went deeper.
          if(isBear ? r[i].low < m : r[i].high > m) { m = isBear ? r[i].low : r[i].high; mt = r[i].time; }
          break;
         }
@@ -381,10 +1006,9 @@ int CeRef(bool isBear, int eShift, double &level, datetime &lvlTime)
   }
 
 // Is the swing at `level` (printed on levelT) an established structure: at
-// least CeContBars candles old and separated from the processed bar (shift 1)
-// by a pullback of at least CeContAtr x ATR? rising: the level is a high.
-// Same definition as Pine's f_swing_sig.
-bool SwingSig(bool rising, double level, datetime levelT)
+// least CeContBars candles old and separated from the processed bar by a
+// pullback of at least CeContAtr x ATR?  (Pine f_swing_sig)
+bool SwingSig(const bool rising, const double level, const datetime levelT)
   {
    int sh = iBarShift(_Symbol, PERIOD_M1, levelT, false);
    int span = sh - 1;
@@ -403,301 +1027,25 @@ bool SwingSig(bool rising, double level, datetime levelT)
    return depth >= CeContAtr * atrM1;
   }
 
-// Wilder ATR(14) of M1, updated once per processed bar (Pine ta.atr).
-void UpdateAtr(const M1Bar &bar)
-  {
-   double tr = bar.h - bar.l;
-   M1Bar p;
-   if(GetM1(2, p)) tr = MathMax(tr, MathMax(MathAbs(bar.h - p.c), MathAbs(bar.l - p.c)));
-   if(atrCount < 14) { trSum += tr; atrCount++; atrM1 = trSum / atrCount; }
-   else atrM1 = (atrM1 * 13.0 + tr) / 14.0;
-  }
-
 //======================================================================
-// POSITION SIZING (tiered risk ladder)
+// TRADES: ladder, closed-trade polling, sizing
 //======================================================================
-
-double RiskForAttempt(int a)
+double RiskForAttempt(const int a)
   {
    switch(a)
      {
-      case 1: return Risk1/100.0;
-      case 2: return Risk2/100.0;
-      case 3: return Risk3/100.0;
-      case 4: return Risk4/100.0;
-      case 5: return Risk5/100.0;
-      default: return Risk6/100.0;
+      case 1: return Risk1 / 100.0;
+      case 2: return Risk2 / 100.0;
+      case 3: return Risk3 / 100.0;
+      case 4: return Risk4 / 100.0;
+      case 5: return Risk5 / 100.0;
+      default: return Risk6 / 100.0;
      }
   }
-
-double CalcLots(double slDistancePrice)
-  {
-   if(slDistancePrice <= 0) return 0;
-   double riskAmount = FixedCapital * RiskForAttempt(attempt);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tickSize <= 0 || tickValue <= 0) return 0;
-   double lots = riskAmount / (slDistancePrice / tickSize * tickValue);
-
-   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lots = MathFloor(lots/lotStep)*lotStep;
-   if(lots < minLot) lots = 0; // too small to size correctly -> skip, mirrors qty>0 guard
-   if(lots > maxLot) lots = maxLot;
-   return lots;
-  }
-
-// After a position closes, roll the attempt counter: win -> back to 1,
-// loss -> one step up (capped at 6). Mirrors the Pine was_in_trade block.
-void UpdateAttemptFromLastDeal()
-  {
-   slJustHit = false;
-   if(!HistorySelect(TimeCurrent()-86400*3, TimeCurrent())) return;
-   int total = HistoryDealsTotal();
-   if(total == 0) return;
-   ulong lastDealTicket = 0; datetime lastDealTime = 0;
-   for(int i=0;i<total;i++)
-     {
-      ulong ticket = HistoryDealGetTicket(i);
-      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)MagicNumber) continue;
-      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-      datetime dt = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
-      if(dt > lastDealTime) { lastDealTime = dt; lastDealTicket = ticket; }
-     }
-   static datetime handledUpTo = 0;
-   if(lastDealTicket == 0 || lastDealTime <= handledUpTo) return;
-   handledUpTo = lastDealTime;
-   double profit = HistoryDealGetDouble(lastDealTicket, DEAL_PROFIT)
-                  + HistoryDealGetDouble(lastDealTicket, DEAL_SWAP)
-                  + HistoryDealGetDouble(lastDealTicket, DEAL_COMMISSION);
-   attempt = (profit > 0) ? 1 : MathMin(attempt+1, 6);
-   slJustHit  = (profit < 0);
-   slWasShort = (HistoryDealGetInteger(lastDealTicket, DEAL_TYPE) == DEAL_TYPE_BUY);   // a buy closes a short
-  }
-
-//======================================================================
-// SWEEP DETECTION — first bar price crosses a level this period.
-//======================================================================
-
-
-bool AnyHighSweep(const M1Bar &bar, double &leveOut)
-  {
-   if(UsePDHL && pdh>0 && !pdhSwept && bar.h >= pdh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pdhSwept=true; leveOut=pdh; return true; }
-   if(UsePWHL && pwh>0 && !pwhSwept && bar.h >= pwh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pwhSwept=true; leveOut=pwh; return true; }
-   if(UseEQL && haveEqh && !eqhSwept && bar.h >= lastEqh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { eqhSwept=true; leveOut=lastEqh; return true; }
-   return false;
-  }
-bool AnyLowSweep(const M1Bar &bar, double &leveOut)
-  {
-   if(UsePDHL && pdl>0 && !pdlSwept && bar.l <= pdl - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pdlSwept=true; leveOut=pdl; return true; }
-   if(UsePWHL && pwl>0 && !pwlSwept && bar.l <= pwl - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pwlSwept=true; leveOut=pwl; return true; }
-   if(UseEQL && haveEql && !eqlSwept && bar.l <= lastEql - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { eqlSwept=true; leveOut=lastEql; return true; }
-   return false;
-  }
-
-//======================================================================
-// MAIN M1 BAR PROCESSOR — the whole state machine, one call per new
-// CLOSED M1 candle, mirroring Pine's default (non-calc_on_every_tick)
-// once-per-bar execution.
-//======================================================================
-
-void ProcessNewM1Bar(const M1Bar &bar)
-  {
-   // --- daily/session trade counters ---
-   int today = DayOf(bar.t);
-   if(today != lastDay) { lastDay = today; tradesToday = 0; }
-   UpdateAtr(bar);
-
-   bool inLondonNow = InLondon(bar.t);
-   bool inNyNow     = InNy(bar.t);
-   bool inAsiaNow   = InAsia(bar.t);
-   if(inLondonNow && !prevInLondon) lonSessionTrades = 0;
-   if(inNyNow && !prevInNy) nySessionTrades = 0;
-   prevInLondon = inLondonNow;
-   prevInNy = inNyNow;
-
-   UpdatePdhPdl();
-   UpdatePwhPwl();
-   UpdateEqlOnNewRefBar();
-   UpdateAttemptFromLastDeal();
-
-   bool canTrade = (tradesToday < MaxTradesPerDay) && !HasOwnPosition();
-   bool canTradeEntry = canTrade && ((inLondonNow && lonSessionTrades < MaxTradesPerSession) ||
-                                      (inNyNow     && nySessionTrades < MaxTradesPerSession));
-
-   // The whole cycle - sweep, CE wait, entry - must start and finish inside
-   // the SAME session (Asia/London/NY). A sweep can only arm while some
-   // session is actually open; carrying an armed cycle across a session
-   // boundary (e.g. sweep in Asia, break/entry attempted once London opens)
-   // breaks the statistical premise sessions are meant to provide.
-   bool inAnySession = inAsiaNow || inLondonNow || inNyNow;
-
-   // --- SECOND CHANCE: a stop-out inside the arming session re-arms the same
-   //     setup once; the new extreme's own swing is the new CE ---
-   if(SecondChance && state == 0 && !chanceUsed && slJustHit && canTrade && inAnySession &&
-      ((cycSessAsia && inAsiaNow) || (cycSessLondon && inLondonNow) || (cycSessNy && inNyNow)))
-     {
-      chanceUsed = true;
-      sweepBarTime = bar.t;
-      activeSweepPx = cycSweepPx;
-      double lv2 = 0; datetime lt2 = bar.t;
-      if(slWasShort)
-        {
-         state = 1;
-         sweepHi = bar.h;
-         ceExtHi = bar.h; ceExtHiT = bar.t;
-         mssRefBear = (CeRef(true, 1, lv2, lt2) >= 0) ? lv2 : bar.l;
-         mssRefBarTime = lt2;
-        }
-      else
-        {
-         state = 2;
-         sweepLo = bar.l;
-         ceExtLo = bar.l; ceExtLoT = bar.t;
-         mssRefBull = (CeRef(false, 1, lv2, lt2) >= 0) ? lv2 : bar.h;
-         mssRefBarTime = lt2;
-        }
-     }
-
-   // --- SWEEP: arm the state machine the instant a level is crossed ---
-   double lvl;
-   if(state == 0 && canTrade && inAnySession)
-     {
-      if(AnyHighSweep(bar, lvl))
-        {
-         state = 1;
-         sweepBarTime = bar.t;
-         cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
-         chanceUsed = false;
-         sweepHi = bar.h;
-         ceExtHi = bar.h; ceExtHiT = bar.t;
-         double lv = 0; datetime lt = bar.t;
-         mssRefBear = (CeRef(true, 1, lv, lt) >= 0) ? lv : bar.l;
-         mssRefBarTime = lt;
-         activeSweepPx = lvl;
-        }
-      else if(AnyLowSweep(bar, lvl))
-        {
-         state = 2;
-         sweepBarTime = bar.t;
-         cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
-         chanceUsed = false;
-         sweepLo = bar.l;
-         ceExtLo = bar.l; ceExtLoT = bar.t;
-         double lv = 0; datetime lt = bar.t;
-         mssRefBull = (CeRef(false, 1, lv, lt) >= 0) ? lv : bar.h;
-         mssRefBarTime = lt;
-         activeSweepPx = lvl;
-        }
-     }
-
-   // --- whole-cycle deadline (covers both the sweep->break hunt and the
-   //     pending-entry wait for a session, same as the Pine version) ---
-   if(state != 0 && BarsBetween(sweepBarTime, bar.t) > MssMaxBars)
-     {
-      state = 0; activeSweepPx = 0;
-      return;
-     }
-
-   // The session that armed this cycle just ended - abandon it instead of
-   // carrying the wait into the next session. A break confirmed in Asia,
-   // still waiting on canTradeEntry once London opens, is exactly the
-   // cross-session carryover this prevents.
-   if(state != 0 && !((cycSessAsia && inAsiaNow) || (cycSessLondon && inLondonNow) || (cycSessNy && inNyNow)))
-     {
-      state = 0; activeSweepPx = 0;
-      return;
-     }
-
-   // --- CE relocation while waiting (states 1/2) ---
-   bool bearMss = false, bullMss = false;
-   // Break first, against the CE formed by the previous bars (a close, not
-   // a wick); only if there is no break does this bar extend the move. The
-   // CE moves only on a NEW extreme, and only to a MORE RECENT qualifying
-   // leg start - same rule as Pine.
-   if(state == 1)
-     {
-      if(bar.t > sweepBarTime && bar.c < mssRefBear) bearMss = true;
-      if(!bearMss)
-        {
-         if(bar.h > sweepHi) sweepHi = bar.h;
-         // CLOSE RULE: the extreme moves only when a candle CLOSES beyond it;
-         // a wick beyond it that closes back inside is annulled.
-         if(bar.c > ceExtHi)
-           {
-            ceExtHi = bar.h; ceExtHiT = bar.t;
-            double lv = 0; datetime lt = 0;
-            if(CeRef(true, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBear = lv; mssRefBarTime = lt; }
-           }
-         else if(bar.h > ceExtHi && !SwingSig(true, ceExtHi, ceExtHiT))
-           { ceExtHi = bar.h; ceExtHiT = bar.t; }   // wick in a swing still forming: the level is the deepest wick
-        }
-     }
-   else if(state == 2)
-     {
-      if(bar.t > sweepBarTime && bar.c > mssRefBull) bullMss = true;
-      if(!bullMss)
-        {
-         if(bar.l < sweepLo) sweepLo = bar.l;
-         if(bar.c < ceExtLo)
-           {
-            ceExtLo = bar.l; ceExtLoT = bar.t;
-            double lv = 0; datetime lt = 0;
-            if(CeRef(false, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBull = lv; mssRefBarTime = lt; }
-           }
-         else if(bar.l < ceExtLo && !SwingSig(false, ceExtLo, ceExtLoT))
-           { ceExtLo = bar.l; ceExtLoT = bar.t; }
-        }
-     }
-
-   if(bearMss) { state = 3; mssBarTime = bar.t; }
-   if(bullMss) { state = 4; mssBarTime = bar.t; }
-
-   // --- PENDING ENTRY: fires the moment London/NY is open, sl/tp already
-   //     anchored to the frozen reaction extreme ---
-   if(state == 3 || state == 4)
-     {
-      if(canTradeEntry)
-        {
-         bool isShort = (state == 3);
-         double slStruct = isShort ? (sweepHi + SweepBuffer) : (sweepLo - SweepBuffer);
-         double slPrice  = isShort
-                            ? (CapSLToMax ? MathMin(slStruct, bar.c + MaxSL) : slStruct)
-                            : (CapSLToMax ? MathMax(slStruct, bar.c - MaxSL) : slStruct);
-         double slDist   = isShort ? (slPrice - bar.c) : (bar.c - slPrice);
-         double tpPrice  = isShort ? (bar.c - slDist*RRRatio) : (bar.c + slDist*RRRatio);
-         double lots     = CalcLots(slDist);
-
-         bool valid = (slDist >= MinSL) && (slDist <= MaxSL) && (lots > 0);
-         if(valid)
-           {
-            bool ok;
-            if(isShort) ok = trade.Sell(lots, _Symbol, 0, slPrice, tpPrice, "LiqShort");
-            else        ok = trade.Buy(lots, _Symbol, 0, slPrice, tpPrice, "LiqLong");
-            if(ok)
-              {
-               tradesToday++;
-               if(inLondonNow) lonSessionTrades++;
-               if(inNyNow)     nySessionTrades++;
-              }
-            cycSweepPx = activeSweepPx;
-            state = 0; activeSweepPx = 0;
-           }
-        }
-      // Not yet in London/NY: stays parked in state 3/4 only until the
-      // ARMING session itself ends (checked above) or the MssMaxBars
-      // deadline hits - never carries into a later session.
-     }
-  }
-
-//======================================================================
-// Helpers used above
-//======================================================================
 
 bool HasOwnPosition()
   {
-   for(int i=0;i<PositionsTotal();i++)
+   for(int i = 0; i < PositionsTotal(); i++)
      {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == (long)MagicNumber)
@@ -706,30 +1054,396 @@ bool HasOwnPosition()
    return false;
   }
 
-int BarsBetween(datetime a, datetime b)
+// Pine: `strategy.closedtrades` grew on this bar -> roll the ladder (win ->
+// back to 1, loss/zero -> one step up) and remember a stop-out for the second
+// chance. Only deals that closed INSIDE the processed bar count.
+void PollClosedTrades(const M1Bar &bar)
   {
-   if(a == 0) return 0;
-   return (int)((b - a) / 60); // M1 bars = whole minutes apart
+   slJustHit = false;
+   bool hasPos = HasOwnPosition();
+   if(g_prevHasPos && !hasPos) g_needPoll = true;
+   // a trade can open AND close inside one bar: never seen as a position
+   if(g_expectClose > 0 && !hasPos) g_needPoll = true;
+   g_prevHasPos = hasPos;
+   if(!g_needPoll) return;
+   if(!HistorySelect(0, TimeCurrent())) return;
+   int total = HistoryDealsTotal();
+   bool beyond = false;
+   for(int i = g_dealScan; i < total; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk == 0) continue;
+      if(HistoryDealGetInteger(tk, DEAL_MAGIC) != (long)MagicNumber || HistoryDealGetString(tk, DEAL_SYMBOL) != _Symbol)
+        { g_dealScan = i + 1; continue; }
+      long entry = HistoryDealGetInteger(tk, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY && entry != DEAL_ENTRY_INOUT)
+        {
+         // an entry deal in the future of this bar must not be skipped over
+         if((datetime)HistoryDealGetInteger(tk, DEAL_TIME) >= bar.t + 60) { beyond = true; break; }
+         g_dealScan = i + 1;
+         continue;
+        }
+      datetime dt = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+      if(dt >= bar.t + 60) { beyond = true; break; }
+      g_dealScan = i + 1;
+      double profit = HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) + HistoryDealGetDouble(tk, DEAL_FEE);
+      long pid = HistoryDealGetInteger(tk, DEAL_POSITION_ID);
+      datetime entryT = 0;
+      for(int j = 0; j < i; j++)
+        {
+         ulong tj = HistoryDealGetTicket(j);
+         if(tj == 0) continue;
+         if(HistoryDealGetInteger(tj, DEAL_POSITION_ID) != pid) continue;
+         if(HistoryDealGetInteger(tj, DEAL_ENTRY) == DEAL_ENTRY_IN)
+           {
+            profit += HistoryDealGetDouble(tj, DEAL_COMMISSION) + HistoryDealGetDouble(tj, DEAL_FEE);
+            entryT = (datetime)HistoryDealGetInteger(tj, DEAL_TIME);
+           }
+        }
+      if(g_expectClose > 0) g_expectClose--;
+      attempt = (profit > 0) ? 1 : MathMin(attempt + 1, 6);
+      slJustHit = (profit < 0);
+      slWasShort = (HistoryDealGetInteger(tk, DEAL_TYPE) == DEAL_TYPE_BUY);   // a buy closes a short
+      lastClosedEntryTime = entryT;
+      Ev(StringFormat("EXIT|%s|profit=%.2f|attempt=%d", TimeToString(dt), profit, attempt));
+     }
+   if(!beyond) g_needPoll = false;
+  }
+
+double CalcLots(const double slDistancePrice)
+  {
+   if(slDistancePrice <= 0) return 0;
+   double riskAmount = FixedCapital * RiskForAttempt(attempt);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0 || tickValue <= 0) return 0;
+   double lots = riskAmount / (slDistancePrice / tickSize * tickValue);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep <= 0) lotStep = 0.01;
+   if(LotRounding == LOT_NEAREST) lots = MathFloor(lots / lotStep + 0.5) * lotStep;
+   else                           lots = MathFloor(lots / lotStep + 1e-9) * lotStep;
+   if(lots < minLot) return 0;
+   if(lots > maxLot) lots = maxLot;
+   return lots;
+  }
+
+//======================================================================
+// CYCLE ARMING (Pine arming blocks, second chance)
+//======================================================================
+void ArmBear(const M1Bar &bar, const bool inAsiaNow, const bool inLondonNow, const bool inNyNow)
+  {
+   state = 1;
+   sweepBarIdx = g_barIdx;
+   cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
+   chanceUsed = false;
+   sweepHi = bar.h;
+   ceExtHi = bar.h; ceExtHiT = bar.t;
+   double lv = 0; datetime lt = bar.t;
+   if(CeRef(true, 1, lv, lt) >= 0) { mssRefBear = lv; mssRefBarTime = lt; }
+   else                            { mssRefBear = bar.l; mssRefBarTime = bar.t; }
+   Ev(StringFormat("ARM|BEAR|%s|hi=%.5f|ce=%.5f", TimeToString(bar.t), sweepHi, mssRefBear));
+  }
+
+void ArmBull(const M1Bar &bar, const bool inAsiaNow, const bool inLondonNow, const bool inNyNow)
+  {
+   state = 2;
+   sweepBarIdx = g_barIdx;
+   cycSessAsia = inAsiaNow; cycSessLondon = inLondonNow; cycSessNy = inNyNow;
+   chanceUsed = false;
+   sweepLo = bar.l;
+   ceExtLo = bar.l; ceExtLoT = bar.t;
+   double lv = 0; datetime lt = bar.t;
+   if(CeRef(false, 1, lv, lt) >= 0) { mssRefBull = lv; mssRefBarTime = lt; }
+   else                             { mssRefBull = bar.h; mssRefBarTime = bar.t; }
+   Ev(StringFormat("ARM|BULL|%s|lo=%.5f|ce=%.5f", TimeToString(bar.t), sweepLo, mssRefBull));
+  }
+
+//======================================================================
+// MAIN M1 BAR PROCESSOR - same order as the Pine script
+//======================================================================
+void InitStateOnFirstBar(const M1Bar &bar)
+  {
+   g_inited = true;
+   for(int i = 0; i < 5; i++) HtfReplay(g_h[i], bar.t);
+   if(UseEQL) EqReplay(bar.t);
+  }
+
+void ProcessNewM1Bar(const M1Bar &bar)
+  {
+   g_barIdx++;
+   if(!g_inited) InitStateOnFirstBar(bar);
+   AtrStep(bar.h, bar.l, bar.c);
+
+   // ---- clock, day and session flags (Pine: hour(time,"UTC+2")) ----
+   datetime pt = PineT(bar.t);
+   MqlDateTime ps;
+   TimeToStruct(pt, ps);
+   bool inLondonNow = InLondonP(ps.hour);
+   bool inNyNow     = InNyP(ps.hour, ps.min);
+   bool inAsiaNow   = InAsiaP(ps.hour);
+   bool inAnySession = inAsiaNow || inLondonNow || inNyNow;
+
+   long dk = DayKeyOf(bar.t);
+   if(dk != lastDayKey) { lastDayKey = dk; tradesToday = 0; }
+   if(inLondonNow && !prevInLondon) lonSessionTrades = 0;
+   if(inNyNow && !prevInNy) nySessionTrades = 0;
+   prevInLondon = inLondonNow;
+   prevInNy = inNyNow;
+
+   PollClosedTrades(bar);
+
+   bool canTrade = (tradesToday < MaxTradesPerDay) && !HasOwnPosition();
+   bool canTradeEntry = canTrade && ((inLondonNow && lonSessionTrades < MaxTradesPerSession) ||
+                                      (inNyNow     && nySessionTrades < MaxTradesPerSession));
+
+   // ---- zones: HTF imbalances -> previous day/week -> equal levels ----
+   for(int i = 0; i < 5; i++) HtfStep(g_h[i], bar.t, bar.h, bar.l);
+   bool touchBearHtf = false, touchBullHtf = false, htfBear = false, htfBull = false;
+   for(int i = 0; i < 5; i++)
+     {
+      if(!g_h[i].use) continue;
+      if(g_h[i].tB) touchBearHtf = true;
+      if(g_h[i].tU) touchBullHtf = true;
+      if(GsN(g_h[i].B) > 0) htfBear = true;
+      if(GsN(g_h[i].U) > 0) htfBull = true;
+     }
+
+   LvPeriods(bar.t);
+
+   bool eqhLiq = false, eqlLiq = false;
+   if(UseEQL)
+     {
+      EqDeliver(bar.t);
+      EqImport(bar.t);
+      datetime nowT = bar.t + 60;
+      LlExpire(g_chH, EqAgeDays, nowT);
+      LlExpire(g_chL, EqAgeDays, nowT);
+      eqhLiq = EqCross(g_chH, true,  bar.t, bar.h, bar.l);
+      eqlLiq = EqCross(g_chL, false, bar.t, bar.h, bar.l);
+     }
+
+   bool pdhLiq = false, pdlLiq = false, pwhLiq = false, pwlLiq = false;
+   if(havePd && !pdhSwept && LvHit(true,  pdh, pdSince, bar.t, bar.h, bar.l)) { pdhSwept = true; pdhLiq = true; }
+   if(havePd && !pdlSwept && LvHit(false, pdl, pdSince, bar.t, bar.h, bar.l)) { pdlSwept = true; pdlLiq = true; }
+   if(havePw && !pwhSwept && LvHit(true,  pwh, pwSince, bar.t, bar.h, bar.l)) { pwhSwept = true; pwhLiq = true; }
+   if(havePw && !pwlSwept && LvHit(false, pwl, pwSince, bar.t, bar.h, bar.l)) { pwlSwept = true; pwlLiq = true; }
+
+   bool hsImb = UseHtfImbEntry && touchBearHtf;
+   bool lsImb = UseHtfImbEntry && touchBullHtf;
+   bool hs = (UsePDHL && pdhLiq) || (UsePWHL && pwhLiq) || (UseEQL && eqhLiq) || hsImb;
+   bool ls = (UsePDHL && pdlLiq) || (UsePWHL && pwlLiq) || (UseEQL && eqlLiq) || lsImb;
+   bool okBear = !UseHtfFilter || htfBear;
+   bool okBull = !UseHtfFilter || htfBull;
+   bool anyHs = hs && okBear && canTrade && inAnySession;
+   bool anyLs = ls && okBull && canTrade && inAnySession;
+   bool hsImbGated = hsImb && okBear && canTrade;
+   bool lsImbGated = lsImb && okBull && canTrade;
+   if(hs || ls)
+      Ev(StringFormat("LIQ|%s|pdh=%d pdl=%d pwh=%d pwl=%d eqh=%d eql=%d imbB=%d imbU=%d", TimeToString(bar.t),
+                      (int)pdhLiq, (int)pdlLiq, (int)pwhLiq, (int)pwlLiq, (int)eqhLiq, (int)eqlLiq, (int)touchBearHtf, (int)touchBullHtf));
+
+   // ---- second chance: a stop-out in the entry's own session re-arms once ----
+   bool stoppedOut = SecondChance && slJustHit && lastClosedEntryTime > 0 && SessKey(lastClosedEntryTime) == SessKey(bar.t);
+   bool sameCycSess = (cycSessAsia && inAsiaNow) || (cycSessLondon && inLondonNow) || (cycSessNy && inNyNow);
+   bool chanceOk = (state == 0) && !chanceUsed && canTrade && sameCycSess;
+   if(chanceOk && stoppedOut && slWasShort)
+     {
+      chanceUsed = true;
+      state = 1;
+      sweepBarIdx = g_barIdx;
+      sweepHi = bar.h;
+      ceExtHi = bar.h; ceExtHiT = bar.t;
+      double lv = 0; datetime lt = bar.t;
+      if(CeRef(true, 1, lv, lt) >= 0) { mssRefBear = lv; mssRefBarTime = lt; }
+      else                            { mssRefBear = bar.l; mssRefBarTime = bar.t; }
+      if(mssRefBear >= bar.c) state = 0;     // already broken: nothing left to wait for
+      Ev(StringFormat("CHANCE|BEAR|%s|state=%d", TimeToString(bar.t), state));
+     }
+   if(chanceOk && stoppedOut && !slWasShort)
+     {
+      chanceUsed = true;
+      state = 2;
+      sweepBarIdx = g_barIdx;
+      sweepLo = bar.l;
+      ceExtLo = bar.l; ceExtLoT = bar.t;
+      double lv = 0; datetime lt = bar.t;
+      if(CeRef(false, 1, lv, lt) >= 0) { mssRefBull = lv; mssRefBarTime = lt; }
+      else                             { mssRefBull = bar.h; mssRefBarTime = bar.t; }
+      if(mssRefBull <= bar.c) state = 0;
+      Ev(StringFormat("CHANCE|BULL|%s|state=%d", TimeToString(bar.t), state));
+     }
+
+   // ---- arming (sequential ifs: an imbalance touch can flip a live cycle) ----
+   if((state == 0 && anyHs) || (state == 2 && hsImbGated))
+      ArmBear(bar, inAsiaNow, inLondonNow, inNyNow);
+   if((state == 0 && anyLs) || (state == 1 && lsImbGated))
+      ArmBull(bar, inAsiaNow, inLondonNow, inNyNow);
+
+   // ---- early deadline for the structure hunt, session carry-over ----
+   if((state == 1 || state == 2) && (g_barIdx - sweepBarIdx) > MssMaxBars)
+      state = 0;
+   if(state != 0 && !((cycSessAsia && inAsiaNow) || (cycSessLondon && inLondonNow) || (cycSessNy && inNyNow)))
+      state = 0;
+
+   // ---- structure break (a CLOSE, on a later candle than the sweep) ----
+   bool bearMss = (state == 1) && (g_barIdx > sweepBarIdx) && (bar.c < mssRefBear);
+   bool bullMss = (state == 2) && (g_barIdx > sweepBarIdx) && (bar.c > mssRefBull);
+
+   // ---- CE relocation: only when a candle CLOSES beyond the extreme ----
+   if(state == 1 && !bearMss)
+     {
+      if(bar.h > sweepHi) sweepHi = bar.h;
+      if(bar.c > ceExtHi)
+        {
+         ceExtHi = bar.h; ceExtHiT = bar.t;
+         double lv = 0; datetime lt = 0;
+         if(CeRef(true, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBear = lv; mssRefBarTime = lt; }
+        }
+      else if(bar.h > ceExtHi && !SwingSig(true, ceExtHi, ceExtHiT))
+        { ceExtHi = bar.h; ceExtHiT = bar.t; }
+     }
+   if(state == 2 && !bullMss)
+     {
+      if(bar.l < sweepLo) sweepLo = bar.l;
+      if(bar.c < ceExtLo)
+        {
+         ceExtLo = bar.l; ceExtLoT = bar.t;
+         double lv = 0; datetime lt = 0;
+         if(CeRef(false, 1, lv, lt) == 1 && lt > mssRefBarTime) { mssRefBull = lv; mssRefBarTime = lt; }
+        }
+      else if(bar.l < ceExtLo && !SwingSig(false, ceExtLo, ceExtLoT))
+        { ceExtLo = bar.l; ceExtLoT = bar.t; }
+     }
+
+   if(bearMss) { state = 3; Ev(StringFormat("MSS|BEAR|%s|ce=%.5f|close=%.5f", TimeToString(bar.t), mssRefBear, bar.c)); }
+   if(bullMss) { state = 4; Ev(StringFormat("MSS|BULL|%s|ce=%.5f|close=%.5f", TimeToString(bar.t), mssRefBull, bar.c)); }
+
+   // ---- entry: the break is the entry, while London/NY is open ----
+   bool shortSig = (state == 3) && canTradeEntry;
+   bool longSig  = (state == 4) && canTradeEntry;
+   if(shortSig || longSig)
+     {
+      bool isShort = shortSig;
+      double slStruct = isShort ? (sweepHi + g_sweepBuf) : (sweepLo - g_sweepBuf);
+      double slPrice  = isShort ? (CapSLToMax ? MathMin(slStruct, bar.c + g_maxSL) : slStruct)
+                                : (CapSLToMax ? MathMax(slStruct, bar.c - g_maxSL) : slStruct);
+      double slDist   = isShort ? (slPrice - bar.c) : (bar.c - slPrice);
+      double tpPrice  = isShort ? (bar.c - (slPrice - bar.c) * RRRatio) : (bar.c + (bar.c - slPrice) * RRRatio);
+      bool valid = (slDist >= g_minSL) && (slDist <= g_maxSL) && (slDist > 0);
+      if(valid)
+        {
+         double lots = CalcLots(slDist);
+         bool ok = false;
+         if(lots > 0)
+           {
+            int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+            double slN = NormalizeDouble(slPrice, dg);
+            double tpN = NormalizeDouble(tpPrice, dg);
+            if(isShort) ok = trade.Sell(lots, _Symbol, 0, slN, tpN, "LiqShort");
+            else        ok = trade.Buy(lots, _Symbol, 0, slN, tpN, "LiqLong");
+           }
+         Ev(StringFormat("ENTRY|%s|%s|close=%.5f|sl=%.5f|tp=%.5f|lots=%.2f|attempt=%d|ok=%d", TimeToString(bar.t),
+                         isShort ? "SHORT" : "LONG", bar.c, slPrice, tpPrice, lots, attempt, (int)ok));
+         if(ok) g_expectClose++;
+         // counters follow the signal, like Pine's strategy.entry bookkeeping
+         tradesToday++;
+         if(inLondonNow) lonSessionTrades++;
+         if(inNyNow)     nySessionTrades++;
+         state = 0;
+        }
+     }
+
+   // ---- late deadline for a break still waiting for a session ----
+   if((state == 3 || state == 4) && (g_barIdx - sweepBarIdx) > MssMaxBars)
+      state = 0;
   }
 
 //======================================================================
 // EA LIFECYCLE
 //======================================================================
+void InitHtf(const int i, const ENUM_TIMEFRAMES tf, const bool use, const int cap, const int ageDays, const long legSec)
+  {
+   g_h[i].tf = tf;
+   g_h[i].use = use;
+   g_h[i].cap = cap;
+   g_h[i].ageDays = ageDays;
+   g_h[i].legSec = legSec;
+   GsClear(g_h[i].cB); GsClear(g_h[i].cU); GsClear(g_h[i].B); GsClear(g_h[i].U);
+   g_h[i].up = 0;
+   g_h[i].fedOpen = 0;
+   g_h[i].nFed = 0;
+   g_h[i].tB = false;
+   g_h[i].tU = false;
+  }
 
 int OnInit()
   {
+   if(EqlRefTF != PERIOD_H1 && EqlRefTF != PERIOD_H4 && EqlRefTF != PERIOD_D1 && EqlRefTF != PERIOD_W1 && EqlRefTF != PERIOD_MN1)
+     {
+      Print("EqlRefTF must be H1, H4, D1, W1 or MN1");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(EqlPivotStrength < 2 || EqlPivotStrength > 50 || EqlLookbackPivots < 2 || EqlLookbackPivots > 20 || MssMaxBars < 5)
+     {
+      Print("Invalid EQ / MSS parameters");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(_Period != PERIOD_M1)
+      Print("LiquidityAlgo is designed for the M1 chart / M1 tester model.");
+
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFillingBySymbol(_Symbol);
-   ArrayResize(swhHist, 0);
-   ArrayResize(swlHist, 0);
+
+   g_tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(g_tick <= 0) g_tick = _Point;
+   g_pen = (LiqPenTicks > 0) ? (LiqPenTicks - 0.01) * g_tick : 0.0;
+   g_thr = ScaleThr ? g_tick / 0.00001 : 1.0;
+   g_sweepBuf  = SweepBuffer * g_thr;
+   g_maxSL     = MaxSL * g_thr;
+   g_minSL     = MinSL * g_thr;
+   g_eqlTol    = EqlTolerance * g_thr;
+   g_htfFvgMin = HtfFvgMin * g_thr;
+   g_mergeTol  = MergeTol * g_thr;
+
+   InitHtf(0, PERIOD_H1,  UseHtf1H, 200, Age1HDays, (long)3 * 3600);
+   InitHtf(1, PERIOD_H4,  UseHtf4H, 200, Age4HDays, (long)3 * 14400);
+   InitHtf(2, PERIOD_D1,  UseHtfD,  60,  0,         (long)4 * 86400);
+   InitHtf(3, PERIOD_W1,  UseHtfW,  60,  0,         (long)3 * 604800);
+   InitHtf(4, PERIOD_MN1, UseHtfM,  24,  0,         (long)3 * 2678400);
+
+   g_eqTf = EqlRefTF;
+   LlClear(g_cxH); LlClear(g_cxL); LlClear(g_chH); LlClear(g_chL);
+   ArrayResize(g_swH, 0); ArrayResize(g_swL, 0); ArrayResize(g_ring, 0);
+   g_eqFedOpen = 0; g_upEQ = 0;
+
+   state = 0; g_barIdx = 0; attempt = 1; chanceUsed = true;
+   g_inited = false; g_prevHasPos = false; g_needPoll = false; g_dealScan = 0; g_expectClose = 0;
    lastSeenFormingBar = 0;
    lastProcessedM1Bar = 0;
-   // Seed the Wilder ATR from the last 14 closed M1 bars so the CE's ATR
-   // floor matches Pine's ta.atr from the first processed bar.
-   for(int i = 15; i >= 1; i--)
+   atrCount = 0; trSum = 0; atrM1 = 0; g_havePrevClose = false;
+
+   // Chronological ATR warm-up from closed M1 history.
+   MqlRates w[];
+   ArraySetAsSeries(w, false);
+   int got = CopyRates(_Symbol, PERIOD_M1, 1, 1500, w);
+   if(got > 20)
      {
-      M1Bar b;
-      if(GetM1(i, b)) UpdateAtr(b);
+      bool asc = (w[0].time <= w[got - 1].time);
+      for(int k = 0; k < got; k++)
+        {
+         int idx = asc ? k : (got - 1 - k);
+         AtrStep(w[idx].high, w[idx].low, w[idx].close);
+        }
+      lastProcessedM1Bar = asc ? w[got - 1].time : w[0].time;
+     }
+
+   if(LogParity)
+     {
+      datetime t0 = TimeCurrent();
+      PrintFormat("EVT|INIT|server=%s|utc=%s|pine=%s|day=%I64d|pen=%.8f|thr=%.4f", TimeToString(t0), TimeToString(ServerToUtc(t0)),
+                  TimeToString(PineT(t0)), DayKeyOf(t0), g_pen, g_thr);
      }
    return(INIT_SUCCEEDED);
   }
@@ -738,17 +1452,15 @@ void OnDeinit(const int reason) {}
 
 void OnTick()
   {
-   // Detect a new M1 bar by watching the still-FORMING bar's own open time
-   // (shift 0) change — that only happens once a new minute has actually
-   // started, meaning the PREVIOUS bar (now at shift 1) just closed. This is
-   // what makes the EA evaluate once per closed M1 bar regardless of tick
-   // volume, mirroring Pine's default (non-calc_on_every_tick) execution.
+   // A new M1 bar is detected when the still-forming bar's open time changes:
+   // the previous bar (shift 1) has just closed. One evaluation per closed bar,
+   // like Pine's order_bar.
    datetime formingBar = iTime(_Symbol, PERIOD_M1, 0);
    if(formingBar == 0 || formingBar == lastSeenFormingBar) return;
    lastSeenFormingBar = formingBar;
 
    M1Bar bar;
-   if(!GetM1(1, bar)) return;      // the bar that just closed
+   if(!GetM1(1, bar)) return;
    if(bar.t == lastProcessedM1Bar) return;
    lastProcessedM1Bar = bar.t;
 
