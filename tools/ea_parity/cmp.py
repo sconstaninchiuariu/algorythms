@@ -18,7 +18,8 @@ def norm(e):
     if ty=='EXIT': return (ty,t,p[3].split('=')[1][0]=='-')
     if ty=='LIQ': return (ty,t,p[3].split()[0:8].__str__())
     return (ty,t)+tuple(p[3:])
-cpp=load('out1.txt',0); ref=load('ref1.txt',0)
+ea_file=sys.argv[2] if len(sys.argv)>2 else 'out1.txt'; ref_file=sys.argv[3] if len(sys.argv)>3 else 'ref1.txt'
+cpp=load(ea_file,0); ref=load(ref_file,0)
 first=cpp[0][1]
 from datetime import datetime,timedelta
 def pt(s): return datetime.strptime(s,'%Y.%m.%d %H:%M')

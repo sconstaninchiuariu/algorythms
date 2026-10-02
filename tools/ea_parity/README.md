@@ -6,7 +6,7 @@ Pine strategy decisions (`pine_ref.py`), on synthetic M1 data.
     ./build.sh                       # C++ build of the EA on a mock MT5 (sanitizers on)
     ./runsim 3 data3.csv > ea3.txt   # run seed 3, dump the M1 data
     python3 pine_ref.py data3.csv > ref3.txt
-    # compare the ARM / MSS / ENTRY / EXIT / LIQ / CHANCE streams after a settle period
+    python3 cmp.py 10 ea3.txt ref3.txt   # 10 = settle days; prints the first divergence
 
 What it checks: syntax/type errors, crashes or out-of-range access, and that the
 EA's zone engine, level consumption, CE engine, second chance and entries produce
