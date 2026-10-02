@@ -67,6 +67,7 @@ input group "=== Liquidity Levels ==="
 input bool   UsePDHL       = true;
 input bool   UsePWHL       = true;
 input bool   UseEQL        = true;
+input int    LiqPenPoints  = 1;       // points beyond a level to count as swept (0 = touch counts)
 input double SweepBuffer   = 0.0;        // SL padding beyond the sweep wick
 
 input group "=== Equal Highs / Lows ==="
@@ -474,16 +475,16 @@ void UpdateAttemptFromLastDeal()
 
 bool AnyHighSweep(const M1Bar &bar, double &leveOut)
   {
-   if(UsePDHL && pdh>0 && !pdhSwept && bar.h >= pdh) { pdhSwept=true; leveOut=pdh; return true; }
-   if(UsePWHL && pwh>0 && !pwhSwept && bar.h >= pwh) { pwhSwept=true; leveOut=pwh; return true; }
-   if(UseEQL && haveEqh && !eqhSwept && bar.h >= lastEqh) { eqhSwept=true; leveOut=lastEqh; return true; }
+   if(UsePDHL && pdh>0 && !pdhSwept && bar.h >= pdh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pdhSwept=true; leveOut=pdh; return true; }
+   if(UsePWHL && pwh>0 && !pwhSwept && bar.h >= pwh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pwhSwept=true; leveOut=pwh; return true; }
+   if(UseEQL && haveEqh && !eqhSwept && bar.h >= lastEqh + (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { eqhSwept=true; leveOut=lastEqh; return true; }
    return false;
   }
 bool AnyLowSweep(const M1Bar &bar, double &leveOut)
   {
-   if(UsePDHL && pdl>0 && !pdlSwept && bar.l <= pdl) { pdlSwept=true; leveOut=pdl; return true; }
-   if(UsePWHL && pwl>0 && !pwlSwept && bar.l <= pwl) { pwlSwept=true; leveOut=pwl; return true; }
-   if(UseEQL && haveEql && !eqlSwept && bar.l <= lastEql) { eqlSwept=true; leveOut=lastEql; return true; }
+   if(UsePDHL && pdl>0 && !pdlSwept && bar.l <= pdl - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pdlSwept=true; leveOut=pdl; return true; }
+   if(UsePWHL && pwl>0 && !pwlSwept && bar.l <= pwl - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { pwlSwept=true; leveOut=pwl; return true; }
+   if(UseEQL && haveEql && !eqlSwept && bar.l <= lastEql - (LiqPenPoints>0 ? (LiqPenPoints-0.01)*_Point : 0.0)) { eqlSwept=true; leveOut=lastEql; return true; }
    return false;
   }
 

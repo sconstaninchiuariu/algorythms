@@ -93,6 +93,10 @@ use_pdhl  = input.bool(true,    "PDH / PDL (Previous Day)",  group = GLIQ)
 use_pwhl  = input.bool(true,    "PWH / PWL (Previous Week)", group = GLIQ)
 sw_len    = input.int(10,       "EQH/EQL Pivot Strength (ref-TF candles each side)",  2, 50, group = GLIQ)
 sweep_buf = input.float(0.0, "Stop Padding (0 = stop exactly at the last extreme)", 0.0, 0.001, 0.00001, group = GLIQ)
+liq_pen_ticks = input.int(1, "Liquidity: ticks beyond the level to count as swept (0 = a touch counts)", 0, 50, group = GLIQ,
+     tooltip = "A level only touched is an equal high/low, not a liquidity grab. Price must trade BEYOND it by this many ticks (1 tick = 0.1 pip on EURUSD) to count as liquidated.")
+// 1% of a tick of slack so float noise cannot turn exactly N ticks into N-epsilon.
+liq_pen = liq_pen_ticks > 0 ? (liq_pen_ticks - 0.01) * syminfo.mintick : 0.0
 
 var string GMSS = "MSS Settings"
 mss_max_bars = input.int(150, "Max Bars for MSS (whole cycle deadline after the sweep)", 5, 500, group = GMSS, tooltip = "How long the bot keeps hunting for the structure break after a zone is liquidated. Price often sweeps a level and then keeps running for another 50-80 bars before the actual reaction, so a short deadline kills the setup right before the trade it was waiting for. A cycle is also abandoned immediately if the session it armed in ends first (Asia/London/NY) — it never waits across a session boundary — so this deadline mainly matters for setups that time out within the same session.")
@@ -321,14 +325,14 @@ f_cross_t(float e, bool is_high, int since) =>
     int res = na
     if not na(e) and not na(since)
         if not hi_15
-            if time >= since and (is_high ? high >= e : low <= e)
+            if time >= since and (is_high ? high >= e + liq_pen : low <= e - liq_pen)
                 res := time - time % 900000
         else
             n = array.size(x15_t)
             if n > 0
                 for i = 0 to n - 1
                     ti = array.get(x15_t, i)
-                    if ti >= since and (is_high ? array.get(x15_h, i) >= e : array.get(x15_l, i) <= e)
+                    if ti >= since and (is_high ? array.get(x15_h, i) >= e + liq_pen : array.get(x15_l, i) <= e - liq_pen)
                         res := ti
                         break
     res
@@ -524,12 +528,12 @@ f_gap_cross(array<float> near_arr, array<float> far_arr, array<int> org_arr, arr
     int   n = array.size(near_arr)
     // Native min/max first: on the vast majority of bars price is nowhere
     // near any gap and the per-gap loop is skipped entirely.
-    if n > 0 and (is_supply ? high >= array.min(near_arr) : low <= array.max(near_arr))
+    if n > 0 and (is_supply ? high >= array.min(near_arr) + liq_pen : low <= array.max(near_arr) - liq_pen)
         hits = array.new_int(0)
         tms  = array.new_int(0)
         for i = 0 to n - 1
             e = array.get(near_arr, i)
-            if is_supply ? high >= e : low <= e
+            if is_supply ? high >= e + liq_pen : low <= e - liq_pen
                 t_hit = f_cross_t(e, is_supply, array.get(cre_arr, i))
                 if not na(t_hit)
                     array.push(hits, i)
@@ -670,7 +674,7 @@ f_ctx_gaps(int cap) =>
     // Touched by this candle (gaps that existed before it) -> gone.
     int i = array.size(bn) - 1
     while i >= 0
-        if time >= array.get(bc, i) and high >= array.get(bn, i)
+        if time >= array.get(bc, i) and high >= array.get(bn, i) + liq_pen
             array.remove(bn, i)
             array.remove(bf, i)
             array.remove(bo, i)
@@ -678,7 +682,7 @@ f_ctx_gaps(int cap) =>
         i -= 1
     i := array.size(un) - 1
     while i >= 0
-        if time >= array.get(uc, i) and low <= array.get(un, i)
+        if time >= array.get(uc, i) and low <= array.get(un, i) - liq_pen
             array.remove(un, i)
             array.remove(uf, i)
             array.remove(uo, i)
@@ -1194,11 +1198,11 @@ f_eqh_cross(array<float> px_arr, array<int> bar_arr, array<int> cre_arr, bool is
     int   touched_bar = na
     int   touched_xt  = na
     n = array.size(px_arr)
-    if n > 0 and (is_high ? high >= array.min(px_arr) : low <= array.max(px_arr))
+    if n > 0 and (is_high ? high >= array.min(px_arr) + liq_pen : low <= array.max(px_arr) - liq_pen)
         for j = 0 to n - 1
             i = n - 1 - j
             e = array.get(px_arr, i)
-            if is_high ? high >= e : low <= e
+            if is_high ? high >= e + liq_pen : low <= e - liq_pen
                 t_hit = f_cross_t(e, is_high, array.get(cre_arr, i))
                 if not na(t_hit)
                     touched     := true
@@ -1239,14 +1243,14 @@ f_ctx_eq() =>
     var float[] swl = array.new_float(0)
     int i = array.size(hp) - 1
     while i >= 0
-        if time >= array.get(hc, i) and high >= array.get(hp, i)
+        if time >= array.get(hc, i) and high >= array.get(hp, i) + liq_pen
             array.remove(hp, i)
             array.remove(hb, i)
             array.remove(hc, i)
         i -= 1
     i := array.size(lp) - 1
     while i >= 0
-        if time >= array.get(lc, i) and low <= array.get(lp, i)
+        if time >= array.get(lc, i) and low <= array.get(lp, i) - liq_pen
             array.remove(lp, i)
             array.remove(lb, i)
             array.remove(lc, i)
