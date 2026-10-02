@@ -92,7 +92,11 @@ var string GLIQ = "Liquidity Levels (HTF POIs)"
 use_pdhl  = input.bool(true,    "PDH / PDL (Previous Day)",  group = GLIQ)
 use_pwhl  = input.bool(true,    "PWH / PWL (Previous Week)", group = GLIQ)
 sw_len    = input.int(10,       "EQH/EQL Pivot Strength (ref-TF candles each side)",  2, 50, group = GLIQ)
-sweep_buf = input.float(0.0, "Stop Padding (0 = stop exactly at the last extreme)", 0.0, 0.001, 0.00001, group = GLIQ)
+scale_thr = input.bool(false, "Scale price thresholds to the symbol (mintick / 0.00001)", group = GLIQ,
+     tooltip = "Off = the price inputs below are used as typed (tuned for EURUSD). On = Sweep padding, min FVG sizes, SL min/max, EQ tolerance and merge tolerance are multiplied by mintick/0.00001, so they stay proportional on indices, stocks and futures.")
+thr_scale = scale_thr ? syminfo.mintick / 0.00001 : 1.0
+sweep_buf_in = input.float(0.0, "Stop Padding (0 = stop exactly at the last extreme)", 0.0, 0.001, 0.00001, group = GLIQ)
+sweep_buf = sweep_buf_in * thr_scale
 liq_pen_ticks = input.int(1, "Liquidity: ticks beyond the level to count as swept (0 = a touch counts)", 0, 50, group = GLIQ,
      tooltip = "A level only touched is an equal high/low, not a liquidity grab. Price must trade BEYOND it by this many ticks (1 tick = 0.1 pip on EURUSD) to count as liquidated.")
 // 1% of a tick of slack so float noise cannot turn exactly N ticks into N-epsilon.
@@ -112,10 +116,12 @@ ce_piv_bars  = input.int(5,      "CE: Displacement base lookback (candles)", 1, 
 ce_run_bars  = input.int(3,      "CE: Displacement impulse run (min candles)", 2, 10, group = GMSS, tooltip = "When a displacement candle ends a run of at least this many consecutive candles in the same direction (an impulse), the CE is the origin of that run: the deeper wick of the pause candle before it and the first candle of the run, even when that pause is smaller than a normal pullback.")
 ce_hist      = input.bool(true,  "Show every CE in the sessions (analysis)", group = GMSS, tooltip = "Draws every CE inside Asia/London/NY on the 1-minute chart, trade or no trade, with the same rules the entries use: a candle CLOSING beyond structure (reversal or continuation). A wick beyond a level without closing is annulled and draws nothing.")
 ce_hist_max  = input.int(150,    "Max CEs shown", 10, 200, group = GMSS)
+ce_hist_txt  = input.bool(false,  "CE analysis: write \"CE\" next to each level", group = GMSS, tooltip = "Off = only the dotted level lines (red = bearish CE, green = bullish CE), no text.")
 
 var string GFVG = "FVG / Imbalance"
 use_fvg_entry = input.bool(false, "Wait for the imbalance retest (otherwise enter on the CE candle)", group = GFVG, tooltip = "OFF (default): liquidity is taken, the CE level is broken, and the order goes in on that very candle. ON: after the break the bot waits for price to come back and retest the imbalance the reaction left behind.")
-fvg_min_gap   = input.float(0.0002, "Min FVG Gap",  0.00005, 0.002, 0.00001, group = GFVG)
+fvg_min_gap_in   = input.float(0.0002, "Min FVG Gap",  0.00005, 0.002, 0.00001, group = GFVG)
+fvg_min_gap = fvg_min_gap_in * thr_scale
 fvg_max_bars  = input.int(30,       "FVG Max Age (bars to wait for the retest before cancelling)",  5, 300, group = GFVG, tooltip = "How long a locked entry zone stays valid waiting for price to come back and retest it. On 1m this is minutes. 60 was letting setups fire an hour after the structure break.")
 fvg_search_bars = input.int(8,      "Bars after MSS to find entry FVG", 1, 50, group = GFVG, tooltip = "The reaction-leg window. Imbalances are only picked up during this many bars after the structure break; the closest/newest one within it wins, and the zone is then LOCKED so it can't drift up the impulse.")
 req_close_fvg = input.bool(true,    "Entry candle must CLOSE inside FVG", group = GFVG)
@@ -127,13 +133,16 @@ use_htf_4h  = input.bool(true,  "4H FVG zones",      group = GHTF)
 use_htf_d   = input.bool(true,  "Daily FVG zones",   group = GHTF)
 use_htf_w   = input.bool(true,  "Weekly FVG zones",  group = GHTF)
 use_htf_m   = input.bool(false, "Monthly FVG zones", group = GHTF)
-htf_fvg_min = input.float(0.0003, "Min HTF FVG Size", 0.00010, 0.010, 0.00010, group = GHTF)
+htf_fvg_min_in = input.float(0.0003, "Min HTF FVG Size", 0.00010, 0.010, 0.00010, group = GHTF)
+htf_fvg_min = htf_fvg_min_in * thr_scale
 use_htf_imb_entry = input.bool(true, "Arm cycle when price manipulates an active HTF imbalance (like other POI)", group = GHTF, tooltip = "Treats an active 1H+ imbalance zone (from the toggles above) as a POI: the instant price enters/manipulates it, the cycle arms and waits for the usual structural break (CE/MSS) before entering — no liquidity sweep required first.")
 
 var string GRSK = "Risk Management"
 rr_ratio   = input.float(2.0,    "RR Ratio",         1.0, 10.0, 0.1,    group = GRSK)
-max_sl     = input.float(0.0050, "Max SL Distance",  0.0005, 0.0200, 0.0001, group = GRSK)
-min_sl     = input.float(0.0003, "Min SL Distance",  0.0001, 0.0020, 0.0001, group = GRSK)
+max_sl_in     = input.float(0.0050, "Max SL Distance",  0.0005, 0.0200, 0.0001, group = GRSK)
+max_sl = max_sl_in * thr_scale
+min_sl_in     = input.float(0.0003, "Min SL Distance",  0.0001, 0.0020, 0.0001, group = GRSK)
+min_sl = min_sl_in * thr_scale
 max_day_tr = input.int(4,        "Max Trades / Day (overall ceiling)", 1, 10,   group = GRSK)
 sess_max_trades = input.int(2,   "Max Trades per Session (London/NY only)", 1, 5, group = GRSK)
 second_chance = input.bool(true, "Second chance after a stop-out (same session, same zone)", group = GRSK,
@@ -152,7 +161,8 @@ r6 = input.float(1.55, "Attempt 6 (%)", 0.1, 5.0, 0.01, group = GTR) / 100
 var string GEQL = "Equal Highs / Lows (Liquidity Pools)"
 use_eql      = input.bool(true,    "Detect and show EQH / EQL",        group = GEQL)
 eql_ref_tf   = input.string("60", "Reference Timeframe (pivots computed here, not the chart's)", options = ["60", "240", "D", "W", "M"], group = GEQL, tooltip = "EQH/EQL pivots are computed on THIS fixed timeframe via request.security, regardless of what timeframe the chart itself is showing — that's what makes the same equal-highs/lows zone appear identically whether you're on a 1m chart or a Daily one. Restricted to 1H and above: POI zones are decided on higher timeframes only, never on the chart's own low-timeframe noise.")
-eql_tol      = input.float(0.0005, "Tolerance (price)",  0.00005, 0.002, 0.00001, group = GEQL, tooltip = "How close two swing points need to be to count as \"equal\" — real equal-highs/lows are rarely the exact same pip, since stops cluster around a level rather than stacking on one price.")
+eql_tol_in      = input.float(0.0005, "Tolerance (price)",  0.00005, 0.002, 0.00001, group = GEQL, tooltip = "How close two swing points need to be to count as \"equal\" — real equal-highs/lows are rarely the exact same pip, since stops cluster around a level rather than stacking on one price.")
+eql_tol = eql_tol_in * thr_scale
 eql_lookback = input.int(5,        "History depth (# pivots)", 2, 20,   group = GEQL)
 
 // Simplified on purpose: short labels here, full explanation in the tooltip
@@ -182,10 +192,13 @@ vis_max_side = input.int(2, "Max Lines Above / Below Price", 1, 10, group = GVIS
      tooltip = "After merging, only this many nearest live lines are drawn above price and the same below. Levels swept this session always show.")
 vis_dist_pct   = input.float(0.25, "Manual: Visibility Distance (% of price)", 0.05, 2.0, 0.01, group = GVIS,
      tooltip = "Used only in Manual mode: a zone shows only while price is within this % of price from it.")
-merge_tol   = input.float(0.0005, "Zone Merge Tolerance", 0.00010, 0.005, 0.00010, group = GVIS,
+merge_tol_in   = input.float(0.0005, "Zone Merge Tolerance", 0.00010, 0.005, 0.00010, group = GVIS,
      tooltip = "Zones within this price distance of each other collapse into one line, names joined with \"·\".")
+merge_tol = merge_tol_in * thr_scale
 lbl_off_bars = input.int(3, "Labels: candles right of the last candle", 0, 30, group = GVIS,
      tooltip = "Labels of live lines sit this many candles to the right of the last candle, in the chart's right margin, instead of on top of price. Names are just the source: 1H / 4H / D / W / MN for imbalances, PDH / PDL / PWH / PWL / EQH / EQL for levels.")
+swept_pre_h = input.int(2, "Swept lines: hours before a session opens that still belong to it", 0, 12, group = GVIS,
+     tooltip = "A swept (frozen) line shows only during the session it was swept in, plus sweeps made up to this many hours before that session opened. Older ones are removed.")
 
 age_1h_d = input.int(14, "Max age 1H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS,
      tooltip = "Older untouched zones are not drawn, identically on every timeframe. D / W / MN imbalances have no limit.")
@@ -237,6 +250,41 @@ order_bar  = barstate.isconfirmed or not barstate.isrealtime
 // One daily request for everything that needs the last CLOSED D candle: ADR,
 // ATR% (volatility cell) and the previous day high / low / open time (PDH/PDL).
 [vis_adr, vol_atr_pct, pd_h, pd_l, pd_t] = request.security(syminfo.tickerid, "D", [ta.sma(high - low, vis_adr_len)[1], (ta.atr(14) / close * 100.0)[1], high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+// Where the previous day's / week's extreme was actually printed (first 15m / 1H
+// bar that made it): the PDH/PDL/PWH/PWL line starts there, not at the candle open.
+f_ext_prev(string tf) =>
+    var int   cur_p = na
+    var float hi_c  = na
+    var float lo_c  = na
+    var int   hi_t  = na
+    var int   lo_t  = na
+    var int   hi_pt = na
+    var int   lo_pt = na
+    int p = time(tf)
+    if not na(p)
+        if na(cur_p) or p != cur_p
+            hi_pt := hi_t
+            lo_pt := lo_t
+            cur_p := p
+            hi_c  := high
+            lo_c  := low
+            hi_t  := time
+            lo_t  := time
+        else
+            if high > hi_c
+                hi_c := high
+                hi_t := time
+            if low < lo_c
+                lo_c := low
+                lo_t := time
+    [hi_pt, lo_pt]
+
+// The extreme's time only if it lies inside its own candle; otherwise the open.
+f_ext_start(int ext_t, int open_t, int span) =>
+    not na(ext_t) and not na(open_t) and ext_t >= open_t and ext_t < open_t + span ? ext_t : open_t
+
+[pd_hit, pd_lot] = request.security(syminfo.tickerid, "15", f_ext_prev("D"), lookahead = barmerge.lookahead_on)
+[pw_hit, pw_lot] = request.security(syminfo.tickerid, "60", f_ext_prev("W"), lookahead = barmerge.lookahead_on)
 // Previous closed week high / low / open time (PWH/PWL).
 [pw_h, pw_l, pw_t] = request.security(syminfo.tickerid, "W", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
 vis_pct_eff  = syminfo.type == "futures" ? vis_dist_pct * 2.0 : vis_dist_pct
@@ -321,6 +369,9 @@ f_cross_t(float e, bool is_high, int since) =>
                     if ti >= since and (is_high ? array.get(x15_h, i) >= e + liq_pen : array.get(x15_l, i) <= e - liq_pen)
                         res := ti
                         break
+            else if n == 0 and time >= since and (is_high ? high >= e + liq_pen : low <= e - liq_pen)
+                // no 15m intrabars delivered for this bar: the chart bar decides
+                res := time - time % 900000
     res
 
 // Session key from a timestamp (FX day stamp * 10 + bucket), used for the
@@ -354,6 +405,20 @@ f_sess_key(int t) =>
 // last session all weekend, so Friday's swept lines never expired). Realtime
 // bars cap it at the bar's own close so Bar Replay still follows the replayed
 // clock. History bars draw nothing, their value is irrelevant.
+// True when a sweep at time t (belonging to session `key`) happened inside that
+// session or at most swept_pre_h hours before it opened.
+f_sw_recent(int t, int key) =>
+    bool ok = true
+    if not na(t) and not na(key)
+        int b  = key % 10
+        int d  = int(key / 10)
+        int oh = b == 1 ? kz_asia_open : b == 3 ? kz_lon_open : kz_ny_open
+        int ots = timestamp("UTC+2", int(d / 10000), int(d / 100) % 100, d % 100, oh, 0)
+        if b == 1 and kz_asia_open > kz_asia_close
+            ots -= 86400000
+        ok := t >= ots - swept_pre_h * 3600000
+    ok
+
 cur_sess_key = render_bar ? f_sess_key(barstate.isrealtime ? math.min(timenow, nz(time_close, timenow) - 1) : timenow) : na
 
 // RE10110 fix: a 2000-deep cap meant the outer/is-supply recompute (O(n log
@@ -533,6 +598,8 @@ f_ctx_gaps(int cap) =>
     var float[] uf = array.new_float(0)
     var float[] uo = array.new_float(0)
     var float[] uc = array.new_float(0)
+    var float[] pk_c = array.from(0.0, 0.0)   // packed snapshot, rebuilt only when something changed
+    bool chg = false
     // Touched by this candle (gaps that existed before it) -> gone.
     if array.size(bn) > 0 and high >= array.min(bn) + liq_pen
         int ib = array.size(bn) - 1
@@ -542,6 +609,7 @@ f_ctx_gaps(int cap) =>
                 array.remove(bf, ib)
                 array.remove(bo, ib)
                 array.remove(bc, ib)
+                chg := true
             ib -= 1
     if array.size(un) > 0 and low <= array.max(un) - liq_pen
         int iu = array.size(un) - 1
@@ -551,10 +619,12 @@ f_ctx_gaps(int cap) =>
                 array.remove(uf, iu)
                 array.remove(uo, iu)
                 array.remove(uc, iu)
+                chg := true
             iu -= 1
     // Same 3-candle rule as before: candle 1 = [2], candle 3 = this one.
     if not na(high[2]) and not na(time_close)
         if low[2] > high and (low[2] - high) >= htf_fvg_min
+            chg := true
             array.push(bn, high)
             array.push(bf, low[2])
             array.push(bo, time[1])
@@ -565,6 +635,7 @@ f_ctx_gaps(int cap) =>
                 array.shift(bo)
                 array.shift(bc)
         if high[2] < low and (low - high[2]) >= htf_fvg_min
+            chg := true
             array.push(un, low)
             array.push(uf, high[2])
             array.push(uo, time[1])
@@ -574,18 +645,20 @@ f_ctx_gaps(int cap) =>
                 array.shift(uf)
                 array.shift(uo)
                 array.shift(uc)
-    pk = array.new_float(0)
-    array.push(pk, array.size(bn))
-    array.push(pk, array.size(un))
-    array.concat(pk, bn)
-    array.concat(pk, bf)
-    array.concat(pk, bo)
-    array.concat(pk, bc)
-    array.concat(pk, un)
-    array.concat(pk, uf)
-    array.concat(pk, uo)
-    array.concat(pk, uc)
-    pk
+    // A returned snapshot is never mutated: on change a NEW array is built.
+    if chg
+        pk_c := array.new_float(0)
+        array.push(pk_c, array.size(bn))
+        array.push(pk_c, array.size(un))
+        array.concat(pk_c, bn)
+        array.concat(pk_c, bf)
+        array.concat(pk_c, bo)
+        array.concat(pk_c, bc)
+        array.concat(pk_c, un)
+        array.concat(pk_c, uf)
+        array.concat(pk_c, uo)
+        array.concat(pk_c, uc)
+    pk_c
 
 // A zone exists only once the candle that completes it has CLOSED. On a live,
 // unconfirmed bar request.security returns the forming bar (on 1H chart / 1H
@@ -627,11 +700,22 @@ f_ctx_import(array<float> pk, bool bear, array<float> near_arr, array<float> far
                                 array.shift(cre_arr)
     mx
 
-pk60  = request.security(syminfo.tickerid, "60",  f_ctx_gaps(htf_gap_cap_1h), lookahead = barmerge.lookahead_off)
-pk240 = request.security(syminfo.tickerid, "240", f_ctx_gaps(htf_gap_cap_4h), lookahead = barmerge.lookahead_off)
-pkD   = request.security(syminfo.tickerid, "D",   f_ctx_gaps(htf_gap_cap_d),  lookahead = barmerge.lookahead_off)
-pkW   = request.security(syminfo.tickerid, "W",   f_ctx_gaps(htf_gap_cap_w),  lookahead = barmerge.lookahead_off)
-pkM   = request.security(syminfo.tickerid, "M",   f_ctx_gaps(htf_gap_cap_m),  lookahead = barmerge.lookahead_off)
+// A timeframe switched off in the inputs is not even requested.
+array<float> pk60  = na
+array<float> pk240 = na
+array<float> pkD   = na
+array<float> pkW   = na
+array<float> pkM   = na
+if use_htf_1h
+    pk60  := request.security(syminfo.tickerid, "60",  f_ctx_gaps(htf_gap_cap_1h), lookahead = barmerge.lookahead_off)
+if use_htf_4h
+    pk240 := request.security(syminfo.tickerid, "240", f_ctx_gaps(htf_gap_cap_4h), lookahead = barmerge.lookahead_off)
+if use_htf_d
+    pkD   := request.security(syminfo.tickerid, "D",   f_ctx_gaps(htf_gap_cap_d),  lookahead = barmerge.lookahead_off)
+if use_htf_w
+    pkW   := request.security(syminfo.tickerid, "W",   f_ctx_gaps(htf_gap_cap_w),  lookahead = barmerge.lookahead_off)
+if use_htf_m
+    pkM   := request.security(syminfo.tickerid, "M",   f_ctx_gaps(htf_gap_cap_m),  lookahead = barmerge.lookahead_off)
 
 var int up60  = 0
 var int up240 = 0
@@ -913,14 +997,14 @@ var int   pwhl_since = na
 if is_new_day and not na(pd_h) and not na(pd_t)
     pdh        := pd_h
     pdl        := pd_l
-    pdh_bar    := pd_t
-    pdl_bar    := pd_t
+    pdh_bar    := f_ext_start(pd_hit, pd_t, 90000000)
+    pdl_bar    := f_ext_start(pd_lot, pd_t, 90000000)
     pdhl_since := pd_t + 86400000
 if is_new_week and not na(pw_h) and not na(pw_t)
     pwh        := pw_h
     pwl        := pw_l
-    pwh_bar    := pw_t
-    pwl_bar    := pw_t
+    pwh_bar    := f_ext_start(pw_hit, pw_t, 691200000)
+    pwl_bar    := f_ext_start(pw_lot, pw_t, 691200000)
     pwhl_since := pw_t + 7 * 86400000
 
 var float asia_live_h = na
@@ -1001,6 +1085,8 @@ f_ctx_eq() =>
     var float[] lc = array.new_float(0)
     var float[] swh = array.new_float(0)
     var float[] swl = array.new_float(0)
+    var float[] pk_c = array.from(0.0, 0.0)
+    bool chg = false
     if array.size(hp) > 0 and high >= array.min(hp) + liq_pen
         int ih = array.size(hp) - 1
         while ih >= 0
@@ -1008,6 +1094,7 @@ f_ctx_eq() =>
                 array.remove(hp, ih)
                 array.remove(hb, ih)
                 array.remove(hc, ih)
+                chg := true
             ih -= 1
     if array.size(lp) > 0 and low <= array.max(lp) - liq_pen
         int il = array.size(lp) - 1
@@ -1016,6 +1103,7 @@ f_ctx_eq() =>
                 array.remove(lp, il)
                 array.remove(lb, il)
                 array.remove(lc, il)
+                chg := true
             il -= 1
     if use_eql and bar_index >= 2 * sw_len and not na(time_close)
         ch = high[sw_len]
@@ -1039,6 +1127,7 @@ f_ctx_eq() =>
                                 if math.abs(ch - array.get(hp, q)) <= eql_tol
                                     dup := true
                         if not dup
+                            chg := true
                             array.push(hp, ch)
                             array.push(hb, time[sw_len])
                             array.push(hc, time_close)
@@ -1062,6 +1151,7 @@ f_ctx_eq() =>
                                 if math.abs(cl - array.get(lp, q)) <= eql_tol
                                     dup := true
                         if not dup
+                            chg := true
                             array.push(lp, cl)
                             array.push(lb, time[sw_len])
                             array.push(lc, time_close)
@@ -1073,16 +1163,17 @@ f_ctx_eq() =>
             if array.size(swl) >= eql_lookback
                 array.shift(swl)
             array.push(swl, cl)
-    pk = array.new_float(0)
-    array.push(pk, array.size(hp))
-    array.push(pk, array.size(lp))
-    array.concat(pk, hp)
-    array.concat(pk, hb)
-    array.concat(pk, hc)
-    array.concat(pk, lp)
-    array.concat(pk, lb)
-    array.concat(pk, lc)
-    pk
+    if chg
+        pk_c := array.new_float(0)
+        array.push(pk_c, array.size(hp))
+        array.push(pk_c, array.size(lp))
+        array.concat(pk_c, hp)
+        array.concat(pk_c, hb)
+        array.concat(pk_c, hc)
+        array.concat(pk_c, lp)
+        array.concat(pk_c, lb)
+        array.concat(pk_c, lc)
+    pk_c
 
 f_eq_import(array<float> pk, bool is_high, array<float> px_arr, array<int> bar_arr, array<int> cre_arr, int upto) =>
     int mx = upto
@@ -1110,7 +1201,9 @@ f_eq_import(array<float> pk, bool is_high, array<float> px_arr, array<int> bar_a
                                 array.shift(cre_arr)
     mx
 
-pkEQ = request.security(syminfo.tickerid, eql_ref_tf, f_ctx_eq(), lookahead = barmerge.lookahead_off)
+array<float> pkEQ = na
+if use_eql
+    pkEQ := request.security(syminfo.tickerid, eql_ref_tf, f_ctx_eq(), lookahead = barmerge.lookahead_off)
 var int upEQ = 0
 imEQh = f_eq_import(pkEQ, true,  eqh_arr, eqh_bar_arr, eqh_cre_arr, upEQ)
 imEQl = f_eq_import(pkEQ, false, eql_arr, eql_bar_arr, eql_cre_arr, upEQ)
@@ -1295,12 +1388,9 @@ var int attempt = 1
 f_risk(int a) =>
     a == 1 ? r1 : a == 2 ? r2 : a == 3 ? r3 : a == 4 ? r4 : a == 5 ? r5 : r6
 
-was_in_trade = strategy.position_size[1] != 0 and strategy.position_size == 0
-if was_in_trade
-    n = strategy.closedtrades - 1
-    if n >= 0
-        last_profit = strategy.closedtrades.profit(n)
-        attempt    := last_profit > 0 ? 1 : math.min(attempt + 1, 6)
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    last_profit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    attempt    := last_profit > 0 ? 1 : math.min(attempt + 1, 6)
 
 f_qty(float sl_dist) =>
     sl_dist > 0.0 ? (fixed_cap * f_risk(attempt)) / sl_dist : 0.0
@@ -1606,7 +1696,7 @@ ls_imb_gated = ls_imb and htf_ok_bull and can_trade and is_exec_tf
 // close beyond it is a regular entry. Seeded exactly like a sweep arm, from
 // the stop-out bar. The session / day trade caps still gate the entry itself.
 last_tr     = strategy.closedtrades - 1
-stopped_out = second_chance and last_tr >= 0 and strategy.closedtrades > nz(strategy.closedtrades[1]) and strategy.closedtrades.profit(last_tr) < 0
+stopped_out = second_chance and last_tr >= 0 and strategy.closedtrades > nz(strategy.closedtrades[1]) and strategy.closedtrades.profit(last_tr) < 0 and f_sess_key(strategy.closedtrades.entry_time(last_tr)) == f_sess_key(time)
 same_cyc_sess = (cyc_sess_asia and in_asia) or (cyc_sess_lon and in_london) or (cyc_sess_ny and in_ny)
 chance_ok   = state == 0 and not chance_used and can_trade and is_exec_tf and same_cyc_sess
 
@@ -2166,7 +2256,7 @@ var label[] ce_hist_labels = array.new<label>(0)
 f_ce_hist_draw(int x1, float y, bool bear_brk) =>
     col = bear_brk ? color.new(color.red, 15) : color.new(color.teal, 15)
     nl  = line.new(x1, y, bar_index, y, color = col, style = line.style_dotted, width = 1)
-    nlb = label.new(bar_index, y, "CE", style = bear_brk ? label.style_label_upper_left : label.style_label_lower_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny)
+    label nlb = ce_hist_txt ? label.new(bar_index, y, "CE", style = bear_brk ? label.style_label_upper_left : label.style_label_lower_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny) : na
     array.push(ce_hist_lines, nl)
     array.push(ce_hist_labels, nlb)
     if array.size(ce_hist_lines) > ce_hist_max
@@ -2542,7 +2632,7 @@ if render_bar
 // session (clock-based key, cur_sess_key) — once that session ends it's gone.
 f_poi_entry(float lvl, bool swept, int sw_t, int sw_s, string nm) =>
     is_active = swept and lvl == active_sweep_px and state != 0
-    same_sess = swept and not na(sw_s) and sw_s == cur_sess_key
+    same_sess = swept and not na(sw_s) and sw_s == cur_sess_key and f_sw_recent(sw_t, sw_s)
     show      = (poi_in_rng(lvl) and not swept) or same_sess
     nm2       = nm
     end_t     = same_sess and not na(sw_t) ? sw_t : time
@@ -3067,8 +3157,8 @@ if show_levels and render_bar
 
 // Sweep markers — the bar this evaluates on IS the candle that crossed the
 // level, so no offset is needed any more.
-plotshape(show_sweep and any_hs, title = "Sweep HIGH", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,  0), size = size.tiny)
-plotshape(show_sweep and any_ls, title = "Sweep LOW",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny)
+plotshape(show_sweep and any_hs, title = "Sweep HIGH", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,  0), size = size.tiny, display = display.pane)
+plotshape(show_sweep and any_ls, title = "Sweep LOW",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny, display = display.pane)
 
 // Structure break ("CE") is now a managed label (ce_lbl, created above at
 // the bear_mss/bull_mss transition, cleared at every cycle reset) instead
@@ -3312,47 +3402,41 @@ if render_bar and show_checklist and state == 0
     table.clear(checklist, 0, 0, 1, 6)
 
 if render_bar and show_checklist and state != 0
-    dir_str = (state == 1 or state == 3) ? "BAJISTA" : "ALCISTA"
-    dir_col = (state == 1 or state == 3) ? color.red : color.teal
-    table.cell(checklist, 0, 0, "SETUP " + dir_str, text_color = color.white, bgcolor = color.new(dir_col, 30), text_size = size.normal)
+    short_side = state == 1 or state == 3
+    dir_col = short_side ? color.red : color.teal
+    table.cell(checklist, 0, 0, short_side ? "▼ SHORT" : "▲ LONG", text_color = color.white, bgcolor = color.new(dir_col, 30), text_size = size.normal)
     table.cell(checklist, 1, 0, "",                 text_color = color.white, bgcolor = color.new(dir_col, 30), text_size = size.normal)
 
     mss_done = state == 3 or state == 4
     fvg_done = mss_done and not na(fvg_top)
 
-    [c1txt, c1col] = f_chk_cell(true, true)
-    table.cell(checklist, 0, 1, "Zona Liquidada",      text_color = color.gray, text_size = size.small)
-    table.cell(checklist, 1, 1, c1txt, text_color = c1col, text_size = size.small)
-
     [c2txt, c2col] = f_chk_cell(mss_done, true)
-    table.cell(checklist, 0, 2, "Cambio Estructura",   text_color = color.gray, text_size = size.small)
-    table.cell(checklist, 1, 2, c2txt, text_color = c2col, text_size = size.small)
+    table.cell(checklist, 0, 1, "CE", text_color = color.gray, text_size = size.small)
+    table.cell(checklist, 1, 1, c2txt, text_color = c2col, text_size = size.small)
 
     // The imbalance rows only exist in the retest mode; in the default mode
-    // the break IS the entry and there is nothing further to tick off.
+    // the break IS the entry, once a trading session is open.
+    int next_row = 2
     if use_fvg_entry
         [c3txt, c3col] = f_chk_cell(fvg_done, true)
-        table.cell(checklist, 0, 3, "Imbalance Formado",   text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, 3, c3txt, text_color = c3col, text_size = size.small)
+        table.cell(checklist, 0, 2, "FVG", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, 2, c3txt, text_color = c3col, text_size = size.small)
 
         [c4txt, c4col] = f_chk_cell(cyc_touched, mss_done)
-        table.cell(checklist, 0, 4, "Retest de Zona",      text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, 4, c4txt, text_color = c4col, text_size = size.small)
+        table.cell(checklist, 0, 3, "Retest", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, 3, c4txt, text_color = c4col, text_size = size.small)
 
         [c5txt, c5col] = f_chk_cell(cyc_close_ok, mss_done and req_close_fvg)
-        table.cell(checklist, 0, 5, "Cierre Confirmación", text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, 5, c5txt, text_color = c5col, text_size = size.small)
+        table.cell(checklist, 0, 4, "Close", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, 4, c5txt, text_color = c5col, text_size = size.small)
+        next_row := 5
     else
-        [c3txt, c3col] = f_chk_cell(state == 3 or state == 4, true)
-        table.cell(checklist, 0, 3, "ENTRADA PENDIENTE",   text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, 3, c3txt, text_color = c3col, text_size = size.small)
-
-        [c4txt, c4col] = f_chk_cell(can_trade_entry, state == 3 or state == 4)
-        table.cell(checklist, 0, 4, "Sesión Abierta",      text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, 4, c4txt, text_color = c4col, text_size = size.small)
+        [c4txt, c4col] = f_chk_cell(can_trade_entry, mss_done)
+        table.cell(checklist, 0, 2, "Session", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, 2, c4txt, text_color = c4col, text_size = size.small)
+        next_row := 3
 
     // Volatility of the open symbol (index or own daily ATR %), last row.
     if show_vol_cell
-        vol_row = use_fvg_entry ? 6 : 5
-        table.cell(checklist, 0, vol_row, "Volatilidad", text_color = color.gray, text_size = size.small)
-        table.cell(checklist, 1, vol_row, vol_txt,       text_color = color.white, text_size = size.small)
+        table.cell(checklist, 0, next_row, "Vol", text_color = color.gray, text_size = size.small)
+        table.cell(checklist, 1, next_row, vol_txt, text_color = color.white, text_size = size.small)
