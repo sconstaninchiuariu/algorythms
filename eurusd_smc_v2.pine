@@ -1846,9 +1846,9 @@ ls_imb_gated = ls_imb and htf_ok_bull and can_trade and is_exec_tf
 last_tr     = strategy.closedtrades - 1
 stopped_out = second_chance and last_tr >= 0 and strategy.closedtrades > nz(strategy.closedtrades[1]) and strategy.closedtrades.profit(last_tr) < 0
 same_cyc_sess = (cyc_sess_asia and in_asia) or (cyc_sess_lon and in_london) or (cyc_sess_ny and in_ny)
-rearm_ok    = state == 0 and not chance_used and can_trade and is_exec_tf and same_cyc_sess
+chance_ok   = state == 0 and not chance_used and can_trade and is_exec_tf and same_cyc_sess
 
-if rearm_ok and stopped_out and strategy.closedtrades.size(last_tr) < 0
+if chance_ok and stopped_out and strategy.closedtrades.size(last_tr) < 0
     chance_used   := true
     state         := 1
     sweep_bar     := bar_index
@@ -1875,7 +1875,7 @@ if rearm_ok and stopped_out and strategy.closedtrades.size(last_tr) < 0
     mss_ref_lbl  := label.new(bar_index, mss_ref_bear, "", style = label.style_none, textcolor = color.yellow, size = size.normal)
     mss_ref_org  := label.new(nz(mss_ref_bar, bar_index), mss_ref_bear, "•", xloc = xloc.bar_index, style = label.style_none, textcolor = color.yellow, size = size.tiny)
 
-if rearm_ok and stopped_out and strategy.closedtrades.size(last_tr) > 0
+if chance_ok and stopped_out and strategy.closedtrades.size(last_tr) > 0
     chance_used   := true
     state         := 2
     sweep_bar     := bar_index
