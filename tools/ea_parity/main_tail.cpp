@@ -25,4 +25,4 @@ int main(int argc,char**argv){ unsigned seed=argc>1?atoi(argv[1]):1; gen(seed); 
   long start=0; for(long i=0;i<(long)M1.size();i++){ if(M1[i].t>=M1[0].t+80L*86400){start=i;break;} }
   CUR=start; if(OnInit()!=INIT_SUCCEEDED){ std::cout<<"init failed\n"; return 1; }
   for(long k=start;k<(long)M1.size()-1;k++){ engine_bar(k); CUR=k+1; OnTick(); }
-  std::cout<<"DONE deals="<<DEALS.size()<<" bars="<<(M1.size()-start)<<"\n"; return 0; }
+  std::cout<<"OBJ created="<<OBJ_COUNT<<" rebuilds="<<OBJ_REBUILDS<<"\n"; std::cout<<"DONE deals="<<DEALS.size()<<" bars="<<(M1.size()-start)<<"\n"; return 0; }

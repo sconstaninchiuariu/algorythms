@@ -135,6 +135,11 @@ input double Risk4 = 1.33;
 input double Risk5 = 1.44;
 input double Risk6 = 1.55;
 
+input group "=== Chart drawing (visual tester / live chart) ==="
+input bool   ShowZones     = true;     // white lines for the live zones (levels, equal highs/lows, imbalances)
+input int    ZonesPerSide  = 3;        // nearest zones drawn above / below price (0 = all)
+input bool   ShowSwept     = true;     // zones taken in the last 24h as grey dotted segments
+
 input group "=== Misc ==="
 input ulong  MagicNumber = 20260902;
 input bool   LogParity   = false;       // print EVT| lines to diff against TradingView
@@ -247,6 +252,15 @@ bool     g_prevHasPos = false;
 bool     g_needPoll   = false;
 int      g_expectClose = 0;   // orders sent whose closing deal has not been seen yet
 int      g_dealScan   = 0;
+
+// drawing
+bool     g_draw = false;
+datetime g_pdhT = 0, g_pdlT = 0, g_pwhT = 0, g_pwlT = 0;   // where each level was printed
+double   g_swPx[];            // zones consumed recently: price, start, end
+datetime g_swT1[];
+datetime g_swT2[];
+string   g_zoneSig = "";
+string   g_liqNote = "";
 
 bool     g_inited = false;
 datetime lastSeenFormingBar = 0;
@@ -456,6 +470,34 @@ void GsClear(GapSide &g)
    ArrayResize(g.fr, 0);
    ArrayResize(g.org, 0);
    ArrayResize(g.cre, 0);
+  }
+
+void SwpPush(const double px, const datetime t1, const datetime t2)
+  {
+   if(!g_draw || !ShowSwept) return;
+   int k = ArraySize(g_swPx);
+   ArrayResize(g_swPx, k + 1);
+   ArrayResize(g_swT1, k + 1);
+   ArrayResize(g_swT2, k + 1);
+   g_swPx[k] = px; g_swT1[k] = t1; g_swT2[k] = t2;
+  }
+
+void SwpPrune(const datetime nowT)
+  {
+   int n = ArraySize(g_swPx);
+   int w = 0;
+   for(int i = 0; i < n; i++)
+     {
+      if(g_swT2[i] < nowT - 86400) continue;
+      g_swPx[w] = g_swPx[i]; g_swT1[w] = g_swT1[i]; g_swT2[w] = g_swT2[i];
+      w++;
+     }
+   if(w != n)
+     {
+      ArrayResize(g_swPx, w);
+      ArrayResize(g_swT1, w);
+      ArrayResize(g_swT2, w);
+     }
   }
 
 int LlN(const LvList &l) { return ArraySize(l.px); }
@@ -676,7 +718,7 @@ bool HtfCross(GapSide &g, const bool isSupply, const long legSec, const datetime
    RecomputeOuter(g, isSupply, legSec, outer);
    bool touch = false;
    for(int i = 0; i < n; i++)
-      if(hit[i] && outer[i]) touch = true;
+      if(hit[i] && outer[i]) { touch = true; SwpPush(g.nr[i], g.cre[i], bt); }
    for(int i = n - 1; i >= 0; i--)
       if(hit[i]) GsRemove(g, i);
    return touch;
@@ -702,11 +744,11 @@ void HtfReplay(HtfTf &h, const datetime tB)
    if(!h.use) return;
    datetime lim = tB + 60;
    datetime from;
-   if(h.tf == PERIOD_H1)       from = tB - (long)(Age1HDays + 30) * 86400;
-   else if(h.tf == PERIOD_H4)  from = tB - (long)(Age4HDays + 60) * 86400;
-   else if(h.tf == PERIOD_D1)  from = tB - (long)900 * 86400;
-   else if(h.tf == PERIOD_W1)  from = tB - (long)300 * 7 * 86400;
-   else                        from = tB - (long)120 * 31 * 86400;
+   if(h.tf == PERIOD_H1)       from = (datetime)(tB - (long)(Age1HDays + 30) * 86400);
+   else if(h.tf == PERIOD_H4)  from = (datetime)(tB - (long)(Age4HDays + 60) * 86400);
+   else if(h.tf == PERIOD_D1)  from = (datetime)(tB - (long)900 * 86400);
+   else if(h.tf == PERIOD_W1)  from = (datetime)(tB - (long)300 * 7 * 86400);
+   else                        from = (datetime)(tB - (long)120 * 31 * 86400);
    MqlRates r[];
    ArraySetAsSeries(r, false);
    int got = CopyRates(_Symbol, h.tf, from, lim, r);
@@ -829,7 +871,7 @@ void EqDeliver(const datetime tB)
 void EqReplay(const datetime tB)
   {
    datetime lim = tB + 60;
-   datetime from = tB - (long)EqReplayBars * PeriodSeconds(g_eqTf);
+   datetime from = (datetime)(tB - (long)EqReplayBars * PeriodSeconds(g_eqTf));
    MqlRates r[];
    ArraySetAsSeries(r, false);
    int got = CopyRates(_Symbol, g_eqTf, from, lim, r);
@@ -886,6 +928,7 @@ bool EqCross(LvList &l, const bool isHigh, const datetime bt, const double H, co
       if(hit)
         {
          touched = true;
+         SwpPush(l.px[i], l.org[i], bt);
          LlRemove(l, i);
         }
      }
@@ -895,6 +938,21 @@ bool EqCross(LvList &l, const bool isHigh, const datetime bt, const double H, co
 //======================================================================
 // PREVIOUS DAY / WEEK  (Pine PDH/PDL/PWH/PWL)
 //======================================================================
+// Time of the highest high / lowest low of tf inside [from, to): where a
+// previous-day / week level was actually printed (line start). Falls back to
+// `from` when the history is not available.
+datetime ExtremeTime(const ENUM_TIMEFRAMES tf, const bool isHigh, const datetime from, const datetime to)
+  {
+   int sFrom = iBarShift(_Symbol, tf, from, false);
+   int sTo   = iBarShift(_Symbol, tf, to - 1, false);
+   if(sFrom < 0 || sTo < 0 || sFrom < sTo) return from;
+   int cnt = sFrom - sTo + 1;
+   int idx = isHigh ? iHighest(_Symbol, tf, MODE_HIGH, cnt, sTo) : iLowest(_Symbol, tf, MODE_LOW, cnt, sTo);
+   if(idx < 0) return from;
+   datetime t = iTime(_Symbol, tf, idx);
+   return (t > 0) ? t : from;
+  }
+
 void LvPeriods(const datetime tB)
   {
    int kd = iBarShift(_Symbol, PERIOD_D1, tB, false);
@@ -908,6 +966,8 @@ void LvPeriods(const datetime tB)
          g_pdOpen = po;
          pdh = ph; pdl = pl;
          pdSince = po + 86400;
+         g_pdhT = ExtremeTime(PERIOD_M1, true,  po, po + 86400);
+         g_pdlT = ExtremeTime(PERIOD_M1, false, po, po + 86400);
          havePd = true;
          pdhSwept = false; pdlSwept = false;
          Ev(StringFormat("LVL|PD|%s|%.5f|%.5f", TimeToString(po), ph, pl));
@@ -924,6 +984,8 @@ void LvPeriods(const datetime tB)
          g_pwOpen = po;
          pwh = ph; pwl = pl;
          pwSince = po + 7 * 86400;
+         g_pwhT = ExtremeTime(PERIOD_H1, true,  po, po + 7 * 86400);
+         g_pwlT = ExtremeTime(PERIOD_H1, false, po, po + 7 * 86400);
          havePw = true;
          pwhSwept = false; pwlSwept = false;
          Ev(StringFormat("LVL|PW|%s|%.5f|%.5f", TimeToString(po), ph, pl));
@@ -1170,6 +1232,138 @@ void InitStateOnFirstBar(const M1Bar &bar)
    if(UseEQL) EqReplay(bar.t);
   }
 
+//======================================================================
+// CHART DRAWING (visual tester / live chart only; never affects trading)
+//======================================================================
+void DrawLine(const string name, const datetime t1, const datetime t2, const double px, const color col,
+              const ENUM_LINE_STYLE st, const bool ray)
+  {
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   if(!ObjectCreate(0, name, OBJ_TREND, 0, t1, px, t2, px)) return;
+   ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, st);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, ray);
+   ObjectSetInteger(0, name, OBJPROP_RAY_LEFT, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+  }
+
+void AddLive(double &px[], datetime &t1[], const double p, const datetime t)
+  {
+   int k = ArraySize(px);
+   ArrayResize(px, k + 1);
+   ArrayResize(t1, k + 1);
+   px[k] = p;
+   t1[k] = t;
+  }
+
+void AddGapLines(const HtfTf &h, double &px[], datetime &t1[])
+  {
+   if(!h.use) return;
+   bool outerB[];
+   bool outerU[];
+   RecomputeOuter(h.B, true,  h.legSec, outerB);
+   RecomputeOuter(h.U, false, h.legSec, outerU);
+   for(int i = 0; i < GsN(h.B); i++) if(outerB[i]) AddLive(px, t1, h.B.nr[i], h.B.cre[i]);
+   for(int i = 0; i < GsN(h.U); i++) if(outerU[i]) AddLive(px, t1, h.U.nr[i], h.U.cre[i]);
+  }
+
+// White ray for every live zone (nearest ZonesPerSide above and below price),
+// grey dotted segment for zones consumed in the last 24h. The objects are
+// rebuilt only when the selection changes.
+void DrawZones(const M1Bar &bar)
+  {
+   SwpPrune(bar.t);
+   double   px[];
+   datetime t1[];
+   if(UsePDHL && havePd)
+     {
+      if(!pdhSwept) AddLive(px, t1, pdh, g_pdhT);
+      if(!pdlSwept) AddLive(px, t1, pdl, g_pdlT);
+     }
+   if(UsePWHL && havePw)
+     {
+      if(!pwhSwept) AddLive(px, t1, pwh, g_pwhT);
+      if(!pwlSwept) AddLive(px, t1, pwl, g_pwlT);
+     }
+   if(UseEQL)
+     {
+      for(int i = 0; i < LlN(g_chH); i++) AddLive(px, t1, g_chH.px[i], g_chH.org[i]);
+      for(int i = 0; i < LlN(g_chL); i++) AddLive(px, t1, g_chL.px[i], g_chL.org[i]);
+     }
+   for(int i = 0; i < 5; i++) AddGapLines(g_h[i], px, t1);
+
+   // nearest ZonesPerSide on each side of price
+   int n = ArraySize(px);
+   int order[];
+   ArrayResize(order, n);
+   for(int i = 0; i < n; i++) order[i] = i;
+   for(int a = 1; a < n; a++)
+     {
+      int key = order[a];
+      double kd = MathAbs(px[key] - bar.c);
+      int b = a - 1;
+      while(b >= 0 && MathAbs(px[order[b]] - bar.c) > kd) { order[b + 1] = order[b]; b--; }
+      order[b + 1] = key;
+     }
+   int nUp = 0, nDn = 0;
+   bool pick[];
+   ArrayResize(pick, n);
+   for(int k = 0; k < n; k++)
+     {
+      int i = order[k];
+      bool up = (px[i] >= bar.c);
+      bool ok = true;
+      if(ZonesPerSide > 0)
+        {
+         if(up) { nUp++; ok = (nUp <= ZonesPerSide); }
+         else   { nDn++; ok = (nDn <= ZonesPerSide); }
+        }
+      pick[i] = ok;
+     }
+
+   string sig = "";
+   for(int i = 0; i < n; i++)
+      if(pick[i]) sig += DoubleToString(px[i], 5) + "@" + IntegerToString((long)t1[i]) + ";";
+   if(ShowSwept)
+      for(int i = 0; i < ArraySize(g_swPx); i++)
+         sig += "s" + DoubleToString(g_swPx[i], 5) + "@" + IntegerToString((long)g_swT1[i]) + "-" + IntegerToString((long)g_swT2[i]) + ";";
+   if(sig == g_zoneSig) return;
+   g_zoneSig = sig;
+
+   ObjectsDeleteAll(0, "LA_");
+   int idx = 0;
+   for(int i = 0; i < n; i++)
+     {
+      if(!pick[i]) continue;
+      datetime a = (t1[i] > 0) ? t1[i] : bar.t;
+      datetime b = (a < bar.t) ? bar.t : a + 60;
+      DrawLine("LA_Z" + IntegerToString(idx), a, b, px[i], clrWhite, STYLE_SOLID, true);
+      idx++;
+     }
+   if(ShowSwept)
+      for(int i = 0; i < ArraySize(g_swPx); i++)
+        {
+         datetime a = (g_swT1[i] > 0) ? g_swT1[i] : g_swT2[i] - 60;
+         datetime b = (g_swT2[i] > a) ? g_swT2[i] : a + 60;
+         DrawLine("LA_S" + IntegerToString(i), a, b, g_swPx[i], clrDimGray, STYLE_DOT, false);
+        }
+  }
+
+void ShowStatus(const M1Bar &bar)
+  {
+   string st = "IDLE";
+   if(state == 1) st = "SWEPT UP - waiting for the bearish CE " + DoubleToString(mssRefBear, 5);
+   if(state == 2) st = "SWEPT DOWN - waiting for the bullish CE " + DoubleToString(mssRefBull, 5);
+   if(state == 3) st = "CE BROKEN - SHORT pending (needs London/NY)";
+   if(state == 4) st = "CE BROKEN - LONG pending (needs London/NY)";
+   Comment("LiquidityAlgo | ", st,
+           "\nTrades today ", tradesToday, "/", MaxTradesPerDay, "  London ", lonSessionTrades, "/", MaxTradesPerSession,
+           "  NY ", nySessionTrades, "/", MaxTradesPerSession, "  risk step ", attempt,
+           "\nLast liquidity: ", g_liqNote);
+  }
+
 void ProcessNewM1Bar(const M1Bar &bar)
   {
    g_barIdx++;
@@ -1230,6 +1424,11 @@ void ProcessNewM1Bar(const M1Bar &bar)
    if(havePw && !pwhSwept && LvHit(true,  pwh, pwSince, bar.t, bar.h, bar.l)) { pwhSwept = true; pwhLiq = true; }
    if(havePw && !pwlSwept && LvHit(false, pwl, pwSince, bar.t, bar.h, bar.l)) { pwlSwept = true; pwlLiq = true; }
 
+   if(pdhLiq) SwpPush(pdh, g_pdhT, bar.t);
+   if(pdlLiq) SwpPush(pdl, g_pdlT, bar.t);
+   if(pwhLiq) SwpPush(pwh, g_pwhT, bar.t);
+   if(pwlLiq) SwpPush(pwl, g_pwlT, bar.t);
+
    bool hsImb = UseHtfImbEntry && touchBearHtf;
    bool lsImb = UseHtfImbEntry && touchBullHtf;
    bool hs = (UsePDHL && pdhLiq) || (UsePWHL && pwhLiq) || (UseEQL && eqhLiq) || hsImb;
@@ -1280,6 +1479,24 @@ void ProcessNewM1Bar(const M1Bar &bar)
       ArmBear(bar, inAsiaNow, inLondonNow, inNyNow);
    if((state == 0 && anyLs) || (state == 1 && lsImbGated))
       ArmBull(bar, inAsiaNow, inLondonNow, inNyNow);
+
+   // ---- what happened to this liquidity (shown on the chart) ----
+   if(g_draw && (hs || ls))
+     {
+      string src = "";
+      if(pdhLiq || pdlLiq) src += " PD";
+      if(pwhLiq || pwlLiq) src += " PW";
+      if(eqhLiq || eqlLiq) src += " EQ";
+      if(touchBearHtf || touchBullHtf) src += " IMB";
+      string why;
+      if(sweepBarIdx == g_barIdx && state != 0) why = "ARMED";
+      else if(!canTrade)                       why = "not armed: position open or day cap";
+      else if(!inAnySession)                   why = "not armed: outside Asia/London/NY";
+      else if((hs && !okBear) || (ls && !okBull)) why = "not armed: HTF filter";
+      else                                     why = "ignored: a cycle is already active";
+      string tstr = TimeToString(bar.t);
+      g_liqNote = tstr + (hs ? " UP" : " DN") + src + " -> " + why;
+     }
 
    // ---- early deadline for the structure hunt, session carry-over ----
    if((state == 1 || state == 2) && (g_barIdx - sweepBarIdx) > MssMaxBars)
@@ -1336,6 +1553,9 @@ void ProcessNewM1Bar(const M1Bar &bar)
         {
          double lots = CalcLots(slDist);
          bool ok = false;
+         if(lots <= 0)
+            Print("LiquidityAlgo: signal ", isShort ? "SHORT" : "LONG", " at ", TimeToString(bar.t),
+                  " skipped: lot size is 0 (below the minimum lot or no tick value)");
          if(lots > 0)
            {
             int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -1343,6 +1563,9 @@ void ProcessNewM1Bar(const M1Bar &bar)
             double tpN = NormalizeDouble(tpPrice, dg);
             if(isShort) ok = trade.Sell(lots, _Symbol, 0, slN, tpN, "LiqShort");
             else        ok = trade.Buy(lots, _Symbol, 0, slN, tpN, "LiqLong");
+            if(!ok)
+               Print("LiquidityAlgo: ORDER REJECTED ", isShort ? "SHORT" : "LONG", " at ", TimeToString(bar.t),
+                     " lots=", DoubleToString(lots, 2), " retcode=", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
            }
          Ev(StringFormat("ENTRY|%s|%s|close=%.5f|sl=%.5f|tp=%.5f|lots=%.2f|attempt=%d|ok=%d", TimeToString(bar.t),
                          isShort ? "SHORT" : "LONG", bar.c, slPrice, tpPrice, lots, attempt, (int)ok));
@@ -1358,6 +1581,13 @@ void ProcessNewM1Bar(const M1Bar &bar)
    // ---- late deadline for a break still waiting for a session ----
    if((state == 3 || state == 4) && (g_barIdx - sweepBarIdx) > MssMaxBars)
       state = 0;
+
+   // drawing is throttled: nothing in it feeds back into the decisions
+   if(g_draw && (g_barIdx % 3) == 1)
+     {
+      DrawZones(bar);
+      ShowStatus(bar);
+     }
   }
 
 //======================================================================
@@ -1395,6 +1625,11 @@ int OnInit()
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFillingBySymbol(_Symbol);
+
+   g_draw = ShowZones && (MQLInfoInteger(MQL_VISUAL_MODE) != 0 || MQLInfoInteger(MQL_TESTER) == 0);
+   g_zoneSig = "";
+   g_liqNote = "none yet";
+   ArrayResize(g_swPx, 0); ArrayResize(g_swT1, 0); ArrayResize(g_swT2, 0);
 
    g_tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(g_tick <= 0) g_tick = _Point;
@@ -1448,7 +1683,14 @@ int OnInit()
    return(INIT_SUCCEEDED);
   }
 
-void OnDeinit(const int reason) {}
+void OnDeinit(const int reason)
+  {
+   if(g_draw)
+     {
+      ObjectsDeleteAll(0, "LA_");
+      Comment("");
+     }
+  }
 
 void OnTick()
   {

@@ -14,6 +14,15 @@ enum ENUM_TIMEFRAMES { PERIOD_M1=1, PERIOD_H1=60, PERIOD_H4=240, PERIOD_D1=1440,
 enum { POSITION_MAGIC=1, DEAL_MAGIC=2, DEAL_ENTRY=3, DEAL_TIME=4, DEAL_POSITION_ID=5, DEAL_TYPE=6, DEAL_PROFIT=7, DEAL_COMMISSION=8, DEAL_FEE=9, DEAL_SYMBOL=10,
  DEAL_ENTRY_IN=0, DEAL_ENTRY_OUT=1, DEAL_ENTRY_OUT_BY=2, DEAL_ENTRY_INOUT=3, DEAL_TYPE_BUY=0, DEAL_TYPE_SELL=1,
  SYMBOL_TRADE_TICK_SIZE=1, SYMBOL_TRADE_TICK_VALUE=2, SYMBOL_VOLUME_MIN=3, SYMBOL_VOLUME_MAX=4, SYMBOL_VOLUME_STEP=5, SYMBOL_DIGITS=6, INIT_SUCCEEDED=0, INIT_PARAMETERS_INCORRECT=1 };
+typedef int color; enum ENUM_LINE_STYLE { STYLE_SOLID=0, STYLE_DOT=2 };
+enum { clrWhite=0xFFFFFF, clrDimGray=0x696969, OBJ_TREND=1, OBJPROP_COLOR=1, OBJPROP_STYLE=2, OBJPROP_WIDTH=3, OBJPROP_RAY_RIGHT=4, OBJPROP_RAY_LEFT=5, OBJPROP_SELECTABLE=6, OBJPROP_BACK=7, MODE_HIGH=1, MODE_LOW=2, MQL_VISUAL_MODE=1, MQL_TESTER=2 };
+extern long OBJ_COUNT, OBJ_REBUILDS;
+long MQLInfoInteger(int);
+int iHighest(const std::string&,ENUM_TIMEFRAMES,int,int,int); int iLowest(const std::string&,ENUM_TIMEFRAMES,int,int,int);
+int ObjectFind(long,const std::string&); bool ObjectDelete(long,const std::string&); bool ObjectCreate(long,const std::string&,int,int,datetime,double,datetime,double);
+bool ObjectSetInteger(long,const std::string&,int,long); int ObjectsDeleteAll(long,const std::string&);
+template<class...A> void Comment(A...){}
+std::string DoubleToString(double,int); std::string IntegerToString(long);
 extern std::string _Symbol; extern ENUM_TIMEFRAMES _Period; extern double _Point;
 // ---- market data ----
 struct Bar { datetime t; double o,h,l,c; };
@@ -42,7 +51,7 @@ inline double MathAbs(double a){return std::fabs(a);} inline double MathFloor(do
 struct Deal { ulong ticket; long magic; long entry; datetime time; long pid; long type; double profit,commission,fee; std::string sym; };
 struct Pos { ulong id; bool isShort; double lots, entry, sl, tp; datetime openT; bool open=false; };
 extern std::vector<Deal> DEALS; extern Pos POS; extern bool PENDING; extern bool pendShort; extern double pendLots,pendSl,pendTp; extern ulong NEXTID;
-struct CTrade { void SetExpertMagicNumber(ulong){} void SetTypeFillingBySymbol(const std::string&){}
+struct CTrade { long ResultRetcode(){return 0;} std::string ResultRetcodeDescription(){return "";} void SetExpertMagicNumber(ulong){} void SetTypeFillingBySymbol(const std::string&){}
   bool Sell(double l,const std::string&,double,double sl,double tp,const std::string&){PENDING=true;pendShort=true;pendLots=l;pendSl=sl;pendTp=tp;return true;}
   bool Buy(double l,const std::string&,double,double sl,double tp,const std::string&){PENDING=true;pendShort=false;pendLots=l;pendSl=sl;pendTp=tp;return true;} };
 int PositionsTotal(); ulong PositionGetTicket(int); bool PositionSelectByTicket(ulong); long PositionGetInteger(int);

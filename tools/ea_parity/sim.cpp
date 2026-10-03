@@ -29,3 +29,12 @@ bool HistorySelect(datetime,datetime){ return true; } int HistoryDealsTotal(){ r
 long HistoryDealGetInteger(ulong t,int p){ const Deal&d=DEALS[t-1]; switch(p){case DEAL_MAGIC:return d.magic;case DEAL_ENTRY:return d.entry;case DEAL_TIME:return d.time;case DEAL_POSITION_ID:return d.pid;case DEAL_TYPE:return d.type;} return 0; }
 double HistoryDealGetDouble(ulong t,int p){ const Deal&d=DEALS[t-1]; switch(p){case DEAL_PROFIT:return d.profit;case DEAL_COMMISSION:return d.commission;case DEAL_FEE:return d.fee;} return 0; }
 std::string HistoryDealGetString(ulong,int){ return "EURUSD"; }
+
+long OBJ_COUNT=0, OBJ_REBUILDS=0;
+long MQLInfoInteger(int p){ return p==MQL_VISUAL_MODE?1:0; }
+int iHighest(const std::string&,ENUM_TIMEFRAMES tf,int,int cnt,int start){ const std::vector<Bar>&v=series(tf); int vc=visCount(tf); int best=-1; double bv=-1e18; for(int s=start;s<start+cnt;s++){ int idx=vc-1-s; if(idx<0) break; if(v[idx].h>bv){bv=v[idx].h;best=s;} } return best; }
+int iLowest(const std::string&,ENUM_TIMEFRAMES tf,int,int cnt,int start){ const std::vector<Bar>&v=series(tf); int vc=visCount(tf); int best=-1; double bv=1e18; for(int s=start;s<start+cnt;s++){ int idx=vc-1-s; if(idx<0) break; if(v[idx].l<bv){bv=v[idx].l;best=s;} } return best; }
+int ObjectFind(long,const std::string&){ return -1; } bool ObjectDelete(long,const std::string&){ return true; }
+bool ObjectCreate(long,const std::string&,int,int,datetime,double,datetime,double){ OBJ_COUNT++; return true; }
+bool ObjectSetInteger(long,const std::string&,int,long){ return true; } int ObjectsDeleteAll(long,const std::string&){ OBJ_REBUILDS++; return 0; }
+std::string DoubleToString(double v,int d){ char b[64]; snprintf(b,64,"%.*f",d,v); return b; } std::string IntegerToString(long v){ return std::to_string(v); }
