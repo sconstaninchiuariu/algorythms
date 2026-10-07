@@ -1906,6 +1906,9 @@ if state == 1 and not bear_mss
         // x1 must move too — a relocation moves the CE to a DIFFERENT candle,
         // not just a different price, so the line's start needs to follow.
         line.set_x1(mss_ref_line, mss_ref_bar)
+        // x2 follows too: a line whose two ends share one bar is drawn as a
+        // vertical ray by TradingView when it extends right.
+        line.set_x2(mss_ref_line, math.max(bar_index + 1, mss_ref_bar + 1))
         line.set_y1(mss_ref_line, mss_ref_bear)
         line.set_y2(mss_ref_line, mss_ref_bear)
         label.set_xy(mss_ref_org, mss_ref_bar, mss_ref_bear)
@@ -1925,6 +1928,7 @@ if state == 2 and not bull_mss
         ce_ext_lo_bar := bar_index
     if not na(mss_ref_line)
         line.set_x1(mss_ref_line, mss_ref_bar)
+        line.set_x2(mss_ref_line, math.max(bar_index + 1, mss_ref_bar + 1))
         line.set_y1(mss_ref_line, mss_ref_bull)
         line.set_y2(mss_ref_line, mss_ref_bull)
         label.set_xy(mss_ref_org, mss_ref_bar, mss_ref_bull)
@@ -1945,7 +1949,7 @@ if bear_mss
     post_hi      := high
     post_hi_bar  := bar_index
     if not na(mss_ref_line)
-        line.set_x2(mss_ref_line, bar_index)
+        line.set_x2(mss_ref_line, math.max(bar_index, nz(mss_ref_bar, bar_index) + 1))
         line.set_extend(mss_ref_line, extend.none)
     label.delete(ce_lbl)
     // With the CE history layer on, this candle already carries its "CE"
@@ -1962,7 +1966,7 @@ if bull_mss
     post_lo      := low
     post_lo_bar  := bar_index
     if not na(mss_ref_line)
-        line.set_x2(mss_ref_line, bar_index)
+        line.set_x2(mss_ref_line, math.max(bar_index, nz(mss_ref_bar, bar_index) + 1))
         line.set_extend(mss_ref_line, extend.none)
     label.delete(ce_lbl)
     ce_lbl := na
