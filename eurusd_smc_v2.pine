@@ -199,6 +199,8 @@ lbl_off_bars = input.int(3, "Labels: candles right of the last candle", 0, 30, g
      tooltip = "Labels of live lines sit this many candles to the right of the last candle, in the chart's right margin, instead of on top of price. Names are just the source: 1H / 4H / D / W / MN for imbalances, PDH / PDL / PWH / PWL / EQH / EQL for levels.", display = display.none)
 swept_pre_h = input.int(2, "Swept lines: hours before a session opens that still belong to it", 0, 12, group = GVIS,
      tooltip = "A swept (frozen) line shows only during the session it was swept in, plus sweeps made up to this many hours before that session opened. Older ones are removed.", display = display.none)
+hunt_dist_pct = input.float(0.15, "While a setup is active: zone visibility distance (% of price, 0 = off)", 0.0, 2.0, 0.01, group = GVIS, display = display.none,
+     tooltip = "After a zone is liquidated and until the cycle ends, only zones within this distance of price are drawn, so the chart is not stretched by far-away lines. The active (green) zone and zones swept this session always show.")
 
 age_1h_d = input.int(14, "Max age 1H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS,
      tooltip = "Older untouched zones are not drawn, identically on every timeframe. D / W / MN imbalances have no limit.", display = display.none)
@@ -288,6 +290,7 @@ f_ext_start(int ext_t, int open_t, int span) =>
 // Previous closed week high / low / open time (PWH/PWL).
 [pw_h, pw_l, pw_t] = request.security(syminfo.tickerid, "W", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
 vis_pct_eff  = syminfo.type == "futures" ? vis_dist_pct * 2.0 : vis_dist_pct
+hunt_pct_eff = syminfo.type == "futures" ? hunt_dist_pct * 2.0 : hunt_dist_pct
 max_poi_dist = vis_mode == "Auto (ADR)" and not na(vis_adr) ? vis_adr * vis_adr_pct / 100.0 : close * vis_pct_eff / 100.0
 
 
@@ -321,6 +324,9 @@ near_reset_dist    = close * near_reset_pct_eff / 100.0
 // respecting the same visible-distance limit as POI lines. One input, one
 // distance, applied identically to both.
 imb_dist = max_poi_dist
+// Effective range used when drawing: narrowed while a setup is being hunted
+// (assigned right before the render pass, once `state` is final for the bar).
+var float eff_dist = na
 
 
 
@@ -1396,7 +1402,7 @@ f_qty(float sl_dist) =>
     sl_dist > 0.0 ? (fixed_cap * f_risk(attempt)) / sl_dist : 0.0
 
 poi_in_rng(float px) =>
-    not na(px) and math.abs(close - px) <= max_poi_dist
+    not na(px) and math.abs(close - px) <= nz(eff_dist, max_poi_dist)
 
 // =============================================================
 // CANDLE DIRECTION
@@ -2502,7 +2508,7 @@ if eql_near_alert
 // =============================================================
 
 f_imb_in_rng(float px) =>
-    not na(px) and math.abs(close - px) <= imb_dist
+    not na(px) and math.abs(close - px) <= nz(eff_dist, imb_dist)
 
 // Near-edge price of each HTF zone: the array-nearest-to-price value
 // (htf_*_edge), computed once per bar above along with htf_*_org (its
@@ -2610,6 +2616,7 @@ if fire_um
 // the last bar). Building them on every historical bar was the single
 // biggest cost of the script: the whole merge/sort/draw pass thousands of
 // times for drawings that were deleted on the very next bar.
+eff_dist := (hunt_dist_pct > 0 and state != 0) ? math.min(max_poi_dist, close * hunt_pct_eff / 100.0) : max_poi_dist
 if render_bar
     n_ml = array.size(managed_poi_lines)
     if n_ml > 0
@@ -3203,7 +3210,7 @@ f_dbg_cnt(array<float> near_arr, array<int> org_arr, int days) =>
 var table dbg_tbl = table.new(position.bottom_left, 3, 16, bgcolor = color.new(color.black, 30), border_width = 1, border_color = color.gray)
 if render_bar and show_zone_dbg
     table.cell(dbg_tbl, 0, 0, "TF " + timeframe.period + "  px " + str.tostring(close, "#.#####"), text_color = color.white, text_size = size.small)
-    table.cell(dbg_tbl, 1, 0, "dist " + str.tostring(max_poi_dist, "#.#####") + "  adr " + str.tostring(vis_adr, "#.#####"), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 0, "dist " + str.tostring(eff_dist, "#.#####") + "  adr " + str.tostring(vis_adr, "#.#####"), text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 2, 0, "sess " + str.tostring(cur_sess_key) + "  lines " + str.tostring(array.size(managed_poi_lines)), text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 0, 1, "zona (n / en rango / viejas)", text_color = color.gray, text_size = size.small)
     table.cell(dbg_tbl, 1, 1, "bear", text_color = color.gray, text_size = size.small)

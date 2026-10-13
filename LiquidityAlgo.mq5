@@ -139,6 +139,7 @@ input group "=== Chart drawing (visual tester / live chart) ==="
 input bool   ShowZones     = true;     // white lines for the live zones (levels, equal highs/lows, imbalances)
 input int    ZonesPerSide  = 3;        // nearest zones drawn above / below price (0 = all)
 input bool   ShowSwept     = true;     // zones taken in the last 24h as grey dotted segments
+input double HuntDistPct   = 0.15;     // while a setup is active, only zones within this % of price are drawn (0 = off)
 
 input group "=== Misc ==="
 input ulong  MagicNumber = 20260902;
@@ -1315,6 +1316,12 @@ void DrawZones(const M1Bar &bar)
       int i = order[k];
       bool up = (px[i] >= bar.c);
       bool ok = true;
+      // a setup is being hunted: far-away zones would only stretch the chart
+      if(state != 0 && HuntDistPct > 0 && MathAbs(px[i] - bar.c) > bar.c * HuntDistPct / 100.0)
+        {
+         pick[i] = false;
+         continue;
+        }
       if(ZonesPerSide > 0)
         {
          if(up) { nUp++; ok = (nUp <= ZonesPerSide); }
