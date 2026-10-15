@@ -201,6 +201,8 @@ swept_pre_h = input.int(2, "Swept lines: hours before a session opens that still
      tooltip = "A swept (frozen) line shows only during the session it was swept in, plus sweeps made up to this many hours before that session opened. Older ones are removed.", display = display.none)
 hunt_dist_pct = input.float(0.15, "While a setup is active: zone visibility distance (% of price, 0 = off)", 0.0, 2.0, 0.01, group = GVIS, display = display.none,
      tooltip = "After a zone is liquidated and until the cycle ends, only zones within this distance of price are drawn, so the chart is not stretched by far-away lines. The active (green) zone and zones swept this session always show.")
+show_zone_log = input.bool(false, "Zone log (Pine Logs): 1H/4H imbalance imports and sizes", group = GVIS, display = display.none,
+     tooltip = "Writes one line to the Pine Logs panel whenever a 1H or 4H imbalance is imported, plus the list sizes on the last bar. Use it to see where a zone is lost.")
 
 age_1h_d = input.int(14, "Max age 1H imbalances (days, 0 = no limit)", 0, 3650, group = GVIS,
      tooltip = "Older untouched zones are not drawn, identically on every timeframe. D / W / MN imbalances have no limit.", display = display.none)
@@ -595,7 +597,7 @@ var int[]   htf_um_cre_arr   = array.new_int(0)
 //
 // Packed result: [n_bear, n_bull, bear near.., far.., org.., cre..,
 // bull near.., far.., org.., cre..].
-f_ctx_gaps(int cap) =>
+f_ctx_gaps(int cap, int age_days) =>
     var float[] bn = array.new_float(0)
     var float[] bf = array.new_float(0)
     var float[] bo = array.new_float(0)
@@ -627,6 +629,21 @@ f_ctx_gaps(int cap) =>
                 array.remove(uc, iu)
                 chg := true
             iu -= 1
+    // Zones past their age limit are dropped here too (the chart does it as
+    // well): the packed snapshot stays small, which TradingView copies per bar.
+    if age_days > 0 and not na(time_close)
+        while array.size(bo) > 0 and time_close - array.get(bo, 0) > age_days * 86400000
+            array.shift(bn)
+            array.shift(bf)
+            array.shift(bo)
+            array.shift(bc)
+            chg := true
+        while array.size(uo) > 0 and time_close - array.get(uo, 0) > age_days * 86400000
+            array.shift(un)
+            array.shift(uf)
+            array.shift(uo)
+            array.shift(uc)
+            chg := true
     // Same 3-candle rule as before: candle 1 = [2], candle 3 = this one.
     if not na(high[2]) and not na(time_close)
         if low[2] > high and (low[2] - high) >= htf_fvg_min
@@ -713,15 +730,15 @@ array<float> pkD   = na
 array<float> pkW   = na
 array<float> pkM   = na
 if use_htf_1h
-    pk60  := request.security(syminfo.tickerid, "60",  f_ctx_gaps(htf_gap_cap_1h), lookahead = barmerge.lookahead_off)
+    pk60  := request.security(syminfo.tickerid, "60",  f_ctx_gaps(htf_gap_cap_1h, age_1h_d), lookahead = barmerge.lookahead_off)
 if use_htf_4h
-    pk240 := request.security(syminfo.tickerid, "240", f_ctx_gaps(htf_gap_cap_4h), lookahead = barmerge.lookahead_off)
+    pk240 := request.security(syminfo.tickerid, "240", f_ctx_gaps(htf_gap_cap_4h, age_4h_d), lookahead = barmerge.lookahead_off)
 if use_htf_d
-    pkD   := request.security(syminfo.tickerid, "D",   f_ctx_gaps(htf_gap_cap_d),  lookahead = barmerge.lookahead_off)
+    pkD   := request.security(syminfo.tickerid, "D",   f_ctx_gaps(htf_gap_cap_d, 0),  lookahead = barmerge.lookahead_off)
 if use_htf_w
-    pkW   := request.security(syminfo.tickerid, "W",   f_ctx_gaps(htf_gap_cap_w),  lookahead = barmerge.lookahead_off)
+    pkW   := request.security(syminfo.tickerid, "W",   f_ctx_gaps(htf_gap_cap_w, 0),  lookahead = barmerge.lookahead_off)
 if use_htf_m
-    pkM   := request.security(syminfo.tickerid, "M",   f_ctx_gaps(htf_gap_cap_m),  lookahead = barmerge.lookahead_off)
+    pkM   := request.security(syminfo.tickerid, "M",   f_ctx_gaps(htf_gap_cap_m, 0),  lookahead = barmerge.lookahead_off)
 
 var int up60  = 0
 var int up240 = 0
@@ -730,9 +747,13 @@ var int upW   = 0
 var int upM   = 0
 im60b  = f_ctx_import(pk60,  true,  htf_b1h_near_arr, htf_b1h_far_arr, htf_b1h_org_arr, htf_b1h_cre_arr, up60,  htf_gap_cap_1h)
 im60u  = f_ctx_import(pk60,  false, htf_u1h_near_arr, htf_u1h_far_arr, htf_u1h_org_arr, htf_u1h_cre_arr, up60,  htf_gap_cap_1h)
+if show_zone_log and (im60b > up60 or im60u > up60)
+    log.info("1H import bear={0} bull={1} ctxSize={2} listB={3} listU={4}", im60b > up60, im60u > up60, array.size(pk60), array.size(htf_b1h_near_arr), array.size(htf_u1h_near_arr))
 up60  := math.max(im60b, im60u)
 im240b = f_ctx_import(pk240, true,  htf_b4h_near_arr, htf_b4h_far_arr, htf_b4h_org_arr, htf_b4h_cre_arr, up240, htf_gap_cap_4h)
 im240u = f_ctx_import(pk240, false, htf_u4h_near_arr, htf_u4h_far_arr, htf_u4h_org_arr, htf_u4h_cre_arr, up240, htf_gap_cap_4h)
+if show_zone_log and (im240b > up240 or im240u > up240)
+    log.info("4H import bear={0} bull={1} ctxSize={2} listB={3} listU={4}", im240b > up240, im240u > up240, array.size(pk240), array.size(htf_b4h_near_arr), array.size(htf_u4h_near_arr))
 up240 := math.max(im240b, im240u)
 imDb   = f_ctx_import(pkD,   true,  htf_bd_near_arr,  htf_bd_far_arr,  htf_bd_org_arr,  htf_bd_cre_arr,  upD,   htf_gap_cap_d)
 imDu   = f_ctx_import(pkD,   false, htf_ud_near_arr,  htf_ud_far_arr,  htf_ud_org_arr,  htf_ud_cre_arr,  upD,   htf_gap_cap_d)
@@ -1082,7 +1103,7 @@ f_eqh_nearest(array<float> px_arr, array<int> bar_arr) =>
 // the same rules as before), so the list does not depend on the
 // chart's history either. Packed: [n_eqh, n_eql, h px.., h bar.., h cre..,
 // l px.., l bar.., l cre..].
-f_ctx_eq() =>
+f_ctx_eq(int age_days) =>
     var float[] hp = array.new_float(0)
     var float[] hb = array.new_float(0)
     var float[] hc = array.new_float(0)
@@ -1111,6 +1132,17 @@ f_ctx_eq() =>
                 array.remove(lc, il)
                 chg := true
             il -= 1
+    if age_days > 0 and not na(time_close)
+        while array.size(hb) > 0 and time_close - array.get(hb, 0) > age_days * 86400000
+            array.shift(hp)
+            array.shift(hb)
+            array.shift(hc)
+            chg := true
+        while array.size(lb) > 0 and time_close - array.get(lb, 0) > age_days * 86400000
+            array.shift(lp)
+            array.shift(lb)
+            array.shift(lc)
+            chg := true
     if use_eql and bar_index >= 2 * sw_len and not na(time_close)
         ch = high[sw_len]
         cl = low[sw_len]
@@ -1209,7 +1241,7 @@ f_eq_import(array<float> pk, bool is_high, array<float> px_arr, array<int> bar_a
 
 array<float> pkEQ = na
 if use_eql
-    pkEQ := request.security(syminfo.tickerid, eql_ref_tf, f_ctx_eq(), lookahead = barmerge.lookahead_off)
+    pkEQ := request.security(syminfo.tickerid, eql_ref_tf, f_ctx_eq(age_eq_d), lookahead = barmerge.lookahead_off)
 var int upEQ = 0
 imEQh = f_eq_import(pkEQ, true,  eqh_arr, eqh_bar_arr, eqh_cre_arr, upEQ)
 imEQl = f_eq_import(pkEQ, false, eql_arr, eql_bar_arr, eql_cre_arr, upEQ)
@@ -3245,6 +3277,9 @@ if render_bar and show_zone_dbg
     table.cell(dbg_tbl, 0, 11, "swept 4H b/u", text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 1, 11, str.tostring(htf_b4h_swept_px, "#.#####") + " " + str.tostring(htf_b4h_swept_s), text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 2, 11, str.tostring(htf_u4h_swept_px, "#.#####") + " " + str.tostring(htf_u4h_swept_s), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 0, 13, "4H ctx size / newest", text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 1, 13, str.tostring(na(pk240) ? 0 : array.size(pk240)) + " / " + (array.size(htf_b4h_near_arr) > 0 ? str.tostring(array.get(htf_b4h_near_arr, array.size(htf_b4h_near_arr) - 1), "#.#####") + " " + str.format_time(array.get(htf_b4h_cre_arr, array.size(htf_b4h_cre_arr) - 1), "dd HH:mm", "UTC+2") : "-"), text_color = color.white, text_size = size.small)
+    table.cell(dbg_tbl, 2, 13, array.size(htf_u4h_near_arr) > 0 ? str.tostring(array.get(htf_u4h_near_arr, array.size(htf_u4h_near_arr) - 1), "#.#####") + " " + str.format_time(array.get(htf_u4h_cre_arr, array.size(htf_u4h_cre_arr) - 1), "dd HH:mm", "UTC+2") : "-", text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 0, 12, "swept EQH / EQL", text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 1, 12, str.tostring(eqh_swept_px, "#.#####") + " " + str.tostring(eqh_swept_s), text_color = color.white, text_size = size.small)
     table.cell(dbg_tbl, 2, 12, str.tostring(eql_swept_px, "#.#####") + " " + str.tostring(eql_swept_s), text_color = color.white, text_size = size.small)
